@@ -1,0 +1,387 @@
+from fastmcp import FastMCP
+
+mcp = FastMCP(
+    name="PoC MCP Server",
+    mask_error_details=True,
+)
+
+
+
+Yes. The cleanest way to implement this is to separate protocol validity from workflow completeness.
+
+The key rule is:
+
+Malformed request → JSON-RPC error.
+Well-formed but insufficient/incorrect user input → request the input again.
+Extra input → ignore it.
+Tool execution failure after valid input → tool/application error.
+
+That distinction will keep your error-handling design consistent with the rest of MCP.
+
+Recommended classification
+Situation	Classification	Server behavior
+Body is malformed JSON	JSON-RPC protocol error	-32700 Parse error
+JSON is valid but not a valid JSON-RPC request	JSON-RPC protocol error	-32600 Invalid Request
+inputResponses itself has an invalid protocol shape	JSON-RPC protocol error	-32602 Invalid Params
+Invalid/nonexistent taskId	JSON-RPC protocol error	-32602 Invalid Params
+Server crashes while processing the request before normal tool execution	JSON-RPC internal error	-32603 Internal Error
+Unknown/unrequested inputResponses key	Not an error	Ignore it
+Required response key is missing	Not an error	Return/maintain input_required
+Response exists but required content is missing	Not necessarily protocol error	Request the information again
+Accepted content has wrong value/type for the requested form	Recoverable input problem	Usually request input again
+User explicitly declines/cancels	Workflow/application decision	Stop, return appropriate result, or request alternative input
+Valid input received, but downstream API fails	Tool execution error	isError: true / application-level error
+Valid input violates business rules	Tool execution/application error	isError: true
+
+The standard MCP error codes distinguish protocol-level invalid parameters from tool execution errors.
+
+The important distinction: invalid inputResponses vs invalid content
+
+This is where I would slightly change the wording in the section you pasted.
+
+Suppose the server requested:
+
+{
+  "github_login": {
+    "method": "elicitation/create",
+    "params": {
+      "mode": "form",
+      "message": "Please provide your GitHub username",
+      "requestedSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": ["name"]
+      }
+    }
+  }
+}
+Case 1 — malformed inputResponses structure
+
+For example:
+
+{
+  "inputResponses": "hello"
+}
+
+or something structurally impossible according to the protocol.
+
+This is a protocol parameter validation failure:
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params",
+    "data": {
+      "field": "inputResponses"
+    }
+  }
+}
+
+That's JSON-RPC territory.
+
+Case 2 — structurally valid, but wrong response
+
+For example:
+
+{
+  "inputResponses": {
+    "github_login": {
+      "action": "accept",
+      "content": {
+        "age": 25
+      }
+    }
+  }
+}
+
+The inputResponses envelope itself is valid. The problem is that the server asked for name, and the client supplied something else.
+
+I would not turn this into -32602.
+
+Instead:
+
+inputResponses is valid
+        ↓
+github_login exists
+        ↓
+action == accept
+        ↓
+content fails requested schema
+        ↓
+return InputRequiredResult again
+
+The current TypeScript SDK explicitly provides schema-aware readers where invalid/missing/declined content resolves as unavailable, allowing the handler to reissue the input request instead of terminating the call.
+
+So:
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "github_login": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "form",
+          "message": "GitHub username is required. Please provide it.",
+          "requestedSchema": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": ["name"]
+          }
+        }
+      }
+    }
+  }
+}
+
+That's probably the biggest thing I'd clarify in your document.
+
+Case 3 — client sends something you never requested
+
+Your example:
+
+{
+  "inputResponses": {
+    "not_requested_info": {
+      "action": "accept",
+      "content": {
+        "not_requested_param_name": "..."
+      }
+    }
+  }
+}
+
+This should simply be:
+
+if response_key not in outstanding_input_requests:
+    ignore(response_key)
+
+Do not return:
+
+-32602
+
+and do not return:
+
+isError: true
+
+Current Tasks guidance explicitly says servers should ignore response keys that are not currently outstanding, including keys that were never issued or have already been satisfied.
+
+Then evaluate whether required information is still missing.
+
+If yes:
+
+ignore unexpected input
+       ↓
+required github_login still missing
+       ↓
+input_required
+Ephemeral/MRTR implementation
+
+For the normal MRTR flow:
+
+tools/call
+   │
+   ▼
+Validate JSON-RPC envelope
+   │
+   ├── malformed JSON ───────────────► -32700
+   │
+   ├── invalid request ──────────────► -32600
+   │
+   └── valid
+        │
+        ▼
+Validate inputResponses envelope
+        │
+        ├── structurally invalid ────► -32602
+        │
+        └── valid
+             │
+             ▼
+       Match requested inputs
+             │
+       ┌─────┴─────────────┐
+       │                   │
+ unexpected key       expected key
+       │                   │
+     ignore          validate content
+                           │
+                  ┌────────┴────────┐
+                  │                 │
+              incomplete         valid
+                  │                 │
+                  ▼                 ▼
+          InputRequiredResult   execute tool
+                                    │
+                            ┌───────┴─────────┐
+                            │                 │
+                         success           failure
+                            │                 │
+                         result          isError=true
+
+MRTR in the 2026-07-28 protocol works exactly around this concept: the server responds with resultType: "input_required" and the client retries the original request with inputResponses.
+
+A simplified handler could therefore look conceptually like:
+
+def handle_tool_call(request):
+
+    # Protocol layer
+    validate_jsonrpc_request(request)
+
+    responses = request.get("inputResponses")
+
+    if responses is not None:
+        validate_input_responses_structure(responses)
+        # structural failure -> -32602
+
+    github_response = get_response(
+        responses,
+        "github_login"
+    )
+
+    # Missing response
+    if github_response is None:
+        return request_github_login()
+
+    # User didn't accept
+    if github_response["action"] != "accept":
+        return handle_decline_or_cancel()
+
+    content = github_response.get("content")
+
+    # Well-formed response, but insufficient content
+    if not valid_github_login(content):
+        return request_github_login(
+            message="Please provide a valid GitHub username."
+        )
+
+    # Now normal tool execution starts
+    try:
+        return execute_tool(content["name"])
+
+    except UpstreamError:
+        return tool_error(
+            "Unable to reach GitHub. Please try again later."
+        )
+
+    except Exception:
+        log_internal_exception()
+        return tool_error(
+            "The tool could not complete the request."
+        )
+
+Notice that the input recovery logic occurs before the tool execution error layer.
+
+Persistent Tasks are slightly different
+
+There is also an important update to the example you pasted.
+
+With the current Tasks extension, the method is:
+
+tasks/update
+
+rather than:
+
+tasks/input_response
+
+The flow is:
+
+tasks/get
+    ↓
+status = input_required
+inputRequests = {...}
+
+client
+    ↓
+tasks/update
+inputResponses = {...}
+
+server
+    ↓
+acknowledge request
+
+    ↓
+
+if required information still missing:
+    task remains input_required
+
+    ↓
+
+next tasks/get
+    ↓
+inputRequests = {...}
+
+Current Tasks specifically allows a partial set of responses; the task remains input_required until the remaining responses arrive. Unknown response keys should be ignored.
+
+So your persistent workflow should conceptually be:
+
+def tasks_update(task_id, input_responses):
+
+    task = task_store.get(task_id)
+
+    if task is None:
+        raise JsonRpcError(
+            code=-32602,
+            message="Unknown taskId"
+        )
+
+    validate_input_responses_structure(input_responses)
+
+    for key, response in input_responses.items():
+
+        # Unexpected / stale input
+        if key not in task.outstanding_input_requests:
+            continue
+
+        if response_is_valid(key, response):
+            task.resolve_input(key, response)
+
+    if task.has_outstanding_inputs():
+        task.status = "input_required"
+    else:
+        task.status = "working"
+
+    return {}
+
+That is much cleaner than treating every incorrect input as an exception.
+
+I would therefore rewrite your error-handling philosophy as
+Protocol validation
+    ↓
+JSONRPCErrorResponse
+
+Input/workflow validation
+    ↓
+InputRequiredResult
+
+Tool/application execution
+    ↓
+CallToolResult(isError=true)
+
+Successful execution
+    ↓
+CallToolResult(isError=false)
+
+And within input/workflow validation:
+
+Unexpected input       → ignore
+Missing input          → request again
+Invalid supplied value → request again
+Decline/cancel         → handle explicitly
+Valid input            → continue execution
+
+That gives you a very clean boundary with the error model we've been discussing: don't use JSON-RPC errors merely because the client/user gave an unusable answer; JSON-RPC errors are for failure of the protocol request itself.
+
+One version note: if the implementation you're documenting is still based on FastMCP 3.4.5, this 2026-07-28 MRTR/Tasks behavior should be documented as a newer-protocol design rather than something 3.4.5 natively provides. FastMCP 4 is the line rebuilt on MCP Python SDK v2 with support for the 2026-07-28 protocol.
