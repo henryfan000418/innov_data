@@ -1,0 +1,18 @@
+### Transport Errors
+
+Transport errors occur at the communication layer between the MCP client and server. They prevent an MCP request or response from being successfully transmitted over the configured transport, such as Streamable HTTP, HTTP/SSE, or stdio.
+
+These errors generally occur outside normal JSON-RPC processing. For example, the client may be unable to establish a connection, the HTTP request may time out, the connection may be interrupted, or the transport stream may close unexpectedly.
+
+Because the failure occurs at the transport layer, the server may never receive or parse the JSON-RPC message, and therefore a JSON-RPC error response such as `-32600` or `-32603` may not be available.
+
+Examples include:
+
+* Connection refused or server unreachable
+* DNS or TLS connection failure
+* HTTP/network timeout
+* Unexpected connection or stream termination
+* Broken pipe or closed stdio stream
+* HTTP transport-level request failure
+
+Transport errors should be handled by the MCP client or transport infrastructure rather than by individual MCP tools.
