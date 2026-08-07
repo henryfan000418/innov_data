@@ -1,0 +1,24 @@
+from fastmcp.exceptions import ToolError
+
+
+def validate_date_range(start_date: str, end_date: str) -> None:
+    if start_date >= end_date:
+        raise ToolError(
+            "INVALID_DATE_RANGE: start_date must be earlier than end_date. "
+            "Correct the dates and call the tool again."
+        )
+
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "The upstream service is temporarily unavailable."
+      }
+    ],
+    "isError": true
+  }
+}
