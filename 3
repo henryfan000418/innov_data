@@ -1,0 +1,547 @@
+Assuming you mean MCP Python SDK 1.x, specifically mcp==1.28.1, together with standalone fastmcp==3.4.5.
+
+For that stack, I would document five standard JSON-RPC errors, plus two special codes that appear in MCP Python 1.28.1. The Python SDK source defines PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR, plus CONNECTION_CLOSED=-32000 and URL_ELICITATION_REQUIRED=-32042.
+
+A minimal FastMCP 3.4.5 server for the examples:
+
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+
+mcp = FastMCP("Error Example")
+
+
+@mcp.tool
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+@mcp.tool
+def divide(a: float, b: float) -> float:
+    if b == 0:
+        raise ToolError("b cannot be zero")
+    return a / b
+
+
+if __name__ == "__main__":
+    mcp.run(
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+    )
+
+FastMCP's HTTP MCP endpoint is normally /mcp.
+
+1. -32700 — Parse Error
+
+This means:
+
+The server cannot even parse the request as JSON.
+
+This happens before MCP method handling and before your tool function runs. JSON-RPC defines -32700 specifically for invalid JSON.
+
+Python client sends
+import httpx
+
+response = httpx.post(
+    "http://localhost:8000/mcp",
+    content='{"jsonrpc":"2.0","id":1,"method":"tools/list"',  # missing }
+    headers={"Content-Type": "application/json"},
+)
+
+print(response.text)
+
+Wire input:
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/list"
+
+Notice that this JSON is incomplete.
+
+Expected output
+{
+  "jsonrpc": "2.0",
+  "id": null,
+  "error": {
+    "code": -32700,
+    "message": "Parse error"
+  }
+}
+Where to handle it
+HTTP / JSON parser
+      ↓
+MCP transport
+      ↓
+your FastMCP server
+
+Your tool code should not try to catch this.
+
+One v1.28.1 caveat: there is a known Python SDK issue around some non-UTF-8 malformed bodies where the v1.x transport can produce an internal error instead of the intended parse error.
+
+2. -32600 — Invalid Request
+
+This is different from parse error.
+
+The JSON itself is valid, but it isn't a valid JSON-RPC request.
+
+For example, method must be a string.
+
+Python
+import httpx
+
+payload = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": 12345,  # invalid
+}
+
+response = httpx.post(
+    "http://localhost:8000/mcp",
+    json=payload,
+)
+
+print(response.text)
+Input
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": 12345
+}
+Output
+
+Conceptually:
+
+{
+  "jsonrpc": "2.0",
+  "id": null,
+  "error": {
+    "code": -32600,
+    "message": "Invalid Request"
+  }
+}
+
+Another example would be:
+
+{
+  "jsonrpc": "1.0",
+  "id": 1,
+  "method": "tools/list"
+}
+
+because MCP uses JSON-RPC "2.0".
+
+Again:
+
+valid JSON
+   ↓
+invalid JSON-RPC object
+   ↓
+-32600
+
+Not:
+
+ToolError
+3. -32601 — Method Not Found
+
+This means:
+
+The JSON-RPC/MCP method does not exist.
+
+This is where an important MCP distinction comes in.
+
+Suppose you send:
+
+payload = {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/delete_everything",
+    "params": {},
+}
+Input
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/delete_everything",
+  "params": {}
+}
+
+There is no MCP protocol method called:
+
+tools/delete_everything
+Output
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32601,
+    "message": "Method not found"
+  }
+}
+
+The current MCP schema describes -32601 as what you return when the requested MCP method isn't implemented or available.
+
+Very important
+
+This:
+
+{
+  "method": "tools/call",
+  "params": {
+    "name": "nonexistent_tool"
+  }
+}
+
+is NOT -32601.
+
+Because:
+
+tools/call
+
+is a valid MCP method.
+
+It's the parameter name that is invalid.
+
+Therefore:
+
+unknown MCP method
+    → -32601
+
+unknown tool passed to tools/call
+    → -32602
+
+That's a useful distinction for your architecture.
+
+4. -32602 — Invalid Params
+
+This will probably be the most important JSON-RPC error for your MCP server.
+
+It means:
+
+The method exists, but its protocol-level parameters are invalid.
+
+The current MCP spec explicitly includes unknown tools and malformed tool arguments under -32602.
+
+Example A — unknown tool
+Input
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "subtract",
+    "arguments": {
+      "a": 10,
+      "b": 5
+    }
+  }
+}
+
+Your server only has:
+
+add
+divide
+
+There is no subtract.
+
+Output
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32602,
+    "message": "Unknown tool: subtract"
+  }
+}
+
+MCP's current tools specification gives exactly this sort of unknown-tool example as a protocol error.
+
+Example B — malformed tool arguments
+
+Your tool is:
+
+@mcp.tool
+def add(a: int, b: int) -> int:
+    return a + b
+
+Client sends:
+
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "add",
+    "arguments": {
+      "a": "abc"
+    }
+  }
+}
+
+Problems:
+
+a should be int
+b missing
+
+Conceptually this is a request/argument validation problem:
+
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params"
+  }
+}
+
+However, this is where you need to be careful with FastMCP behavior versus conceptual MCP classification. FastMCP may expose some argument-validation failures as tool errors depending on where validation occurs. The protocol rule to keep in your design is: malformed tools/call request/arguments at the protocol boundary → -32602; domain/business validation after the tool is invoked → isError=true. MCP explicitly draws that distinction.
+
+5. -32603 — Internal Error
+
+This means:
+
+Something inside the MCP server/framework prevented the request from being processed.
+
+For example:
+
+MCP dispatcher bug
+serialization failure
+middleware failure
+unexpected server framework exception
+Input
+
+The request itself can be completely valid:
+
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/list",
+  "params": {}
+}
+
+Imagine the MCP server itself unexpectedly fails while building the tool list.
+
+Output
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "error": {
+    "code": -32603,
+    "message": "Internal error"
+  }
+}
+
+You could construct the equivalent object in MCP Python 1.28.1 with:
+
+from mcp.types import (
+    JSONRPCError,
+    ErrorData,
+    INTERNAL_ERROR,
+)
+
+response = JSONRPCError(
+    jsonrpc="2.0",
+    id=5,
+    error=ErrorData(
+        code=INTERNAL_ERROR,
+        message="Internal error",
+    ),
+)
+
+JSONRPCError, ErrorData, and INTERNAL_ERROR=-32603 are defined in mcp.types in Python SDK 1.28.1.
+
+But don't do this for normal exceptions inside your tool.
+
+That's an important FastMCP distinction.
+
+Normal Python exception inside a FastMCP tool ≠ -32603
+
+Consider:
+
+@mcp.tool
+def get_customer(customer_id: int):
+    raise RuntimeError("Database connection failed")
+
+In FastMCP, normal exceptions raised while executing a tool are converted into MCP tool execution errors rather than necessarily becoming JSON-RPC -32603. FastMCP documents that tool exceptions are converted to MCP error results visible to the LLM.
+
+Wire result conceptually:
+
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Database connection failed"
+      }
+    ],
+    "isError": true
+  }
+}
+
+This is not:
+
+{
+  "error": {
+    "code": -32603
+  }
+}
+
+That distinction is important.
+
+6. -32042 — URL Elicitation Required
+
+Python MCP SDK 1.28.1 also defines:
+
+URL_ELICITATION_REQUIRED = -32042
+
+This was used in the 2025-era protocol for cases where the operation requires browser/user interaction, typically OAuth. MCP defines the error data as containing one or more required URL elicitations.
+
+Python
+
+Conceptually:
+
+from mcp.shared.exceptions import UrlElicitationRequiredError
+from mcp.types import ElicitRequestURLParams
+
+raise UrlElicitationRequiredError(
+    [
+        ElicitRequestURLParams(
+            mode="url",
+            message="Authorize access to GitHub",
+            url="https://example.com/oauth/authorize",
+            elicitationId="abc-123",
+        )
+    ]
+)
+
+The Python SDK documents this pattern and says the framework converts it to -32042.
+
+Input
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "connect_github",
+    "arguments": {}
+  }
+}
+Output
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "error": {
+    "code": -32042,
+    "message": "This request requires more information.",
+    "data": {
+      "elicitations": [
+        {
+          "mode": "url",
+          "elicitationId": "abc-123",
+          "url": "https://example.com/oauth/authorize",
+          "message": "Authorize access to GitHub"
+        }
+      ]
+    }
+  }
+}
+
+For your FastMCP 3.4.5 / Python SDK 1.x design, this is relevant if you're implementing the 2025-11-25 URL elicitation workflow.
+
+7. -32000 — CONNECTION_CLOSED
+
+Python MCP SDK 1.28.1 also contains:
+
+CONNECTION_CLOSED = -32000
+
+But I would not put this in the same server error-handling table as the previous six.
+
+Why?
+
+Because this is primarily an SDK/runtime connection error, rather than a normal application-generated JSON-RPC response from your FastMCP tool.
+
+For example:
+
+from mcp import ClientSession
+
+# server connection disappears
+result = await session.call_tool("add", {"a": 1, "b": 2})
+
+Conceptually the client may surface:
+
+McpError:
+code = -32000
+message = "Connection closed"
+
+There may be no corresponding JSON response because:
+
+connection closed
+      ↓
+there is no channel
+      ↓
+server cannot send JSON-RPC response
+
+So don't design code like:
+
+return JSONRPCError(code=-32000)
+
+for application failures.
+
+Your final table
+
+For MCP Python 1.28.1 + FastMCP 3.4.5, I'd put this table into your error-handling documentation:
+
+Code	Meaning	Example	Where handled
+-32700	Parse Error	malformed JSON	Transport / JSON parser
+-32600	Invalid Request	invalid JSON-RPC envelope	MCP framework
+-32601	Method Not Found	tools/foo	MCP dispatcher
+-32602	Invalid Params	unknown tool / malformed MCP params	MCP/FastMCP validation
+-32603	Internal Error	unexpected MCP server/framework failure	Global server handler
+-32042	URL Elicitation Required	OAuth/browser authorization needed	MCP elicitation workflow
+-32000	Connection Closed	session/transport disappears	SDK/transport, usually client side
+
+And then separately:
+
+Failure	Do NOT use JSON-RPC error	Use
+API returns 500	❌ -32603	isError: true
+DB query fails	❌ -32603	isError: true
+Customer ID doesn't exist	❌ -32602	isError: true
+Date is outside allowed range	❌ -32602	isError: true
+Business-rule violation	❌ JSON-RPC error	isError: true / ToolError
+Bad MCP request structure	✅	JSON-RPC error
+Unknown MCP method	✅	-32601
+Unknown tool	✅	-32602
+
+That last distinction is explicitly how MCP describes tool errors: protocol/request problems use JSON-RPC errors, while API failures, domain input validation, and business-logic errors belong in CallToolResult with isError: true.
+
+For your implementation, I would therefore build the hierarchy as:
+
+Request
+  │
+  ├── JSON unreadable
+  │      └── -32700
+  │
+  ├── Invalid JSON-RPC
+  │      └── -32600
+  │
+  ├── Unknown MCP method
+  │      └── -32601
+  │
+  ├── Invalid MCP parameters / unknown tool
+  │      └── -32602
+  │
+  ├── MCP server/framework crashes
+  │      └── -32603
+  │
+  └── Valid tools/call
+         │
+         ├── Tool works
+         │      └── isError=false
+         │
+         └── Tool/API/business failure
+                └── isError=true
+                    ToolError
+
+That is the error model I'd recommend implementing around FastMCP 3.4.5, rather than manually throwing JSON-RPC codes from individual Python tool functions.
