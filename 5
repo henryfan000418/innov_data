@@ -1,0 +1,1599 @@
+FastMCP 3.4.5 + MCP Python SDK 1.x Error Handling Guidelines
+
+1. Purpose
+
+This document provides recommended error-handling practices for applications built with:
+
+FastMCP 3.4.5
++
+MCP Python SDK 1.x
+
+FastMCP sits above the lower-level MCP Python SDK and handles much of the tool registration, schema generation, validation, serialization, transport integration, and tool-result mapping.
+
+Therefore, the recommended architecture is:
+
+Business Logic
+      ↓
+Application Errors
+      ↓
+FastMCP Error Adapter
+      ↓
+FastMCP 3.4.5
+      ↓
+MCP Python SDK 1.x
+      ↓
+MCP Protocol / Transport
+
+The primary recommendation is:
+
+Do not make application error semantics depend on implicit FastMCP or MCP SDK exception handling.
+
+Define application-level errors first, then intentionally map them into FastMCP tool errors, middleware behavior, or framework-level failures.
+
+⸻
+
+2. Recommended Error Taxonomy
+
+MCP Server errors should be divided into four major categories:
+
+MCP Server Error
+│
+├── 1. Transport Error
+│
+├── 2. Authentication /
+│       Authorization Error
+│
+├── 3. MCP / JSON-RPC
+│       Protocol Error
+│
+└── 4. Tool Execution Error
+        │
+        ├── Structural /
+        │   Type Validation
+        │
+        ├── Semantic /
+        │   Domain Validation
+        │
+        ├── Business Logic Error
+        │
+        ├── Upstream /
+        │   Dependency Error
+        │
+        └── Expected Runtime Error
+
+FastMCP handles some of these layers automatically, but the application should still define consistent error semantics above the framework.
+
+⸻
+
+3. Key Limitation of MCP SDK 1.x
+
+One of the main risks of MCP SDK 1.x is relying on implicit SDK exception handling.
+
+When FastMCP 3.4.5 is added, there is another abstraction layer between application code and the MCP protocol.
+
+For example:
+
+@mcp.tool
+async def get_account(
+    account_id: str
+):
+    if not account_id:
+        raise ValueError(
+            "account_id is required"
+        )
+
+Developers should not assume that:
+
+ValueError
+   ↓
+Parameter Error
+   ↓
+Tool Error
+   ↓
+isError = true
+
+always represents the intended application semantics.
+
+The final behavior can depend on:
+
+FastMCP behavior
+MCP SDK behavior
+validation stage
+exception type
+tool wrapper behavior
+where the exception occurs
+
+Avoid this architecture:
+
+Python Exception
+      ↓
+FastMCP / MCP SDK
+      ↓
+Implicit Error Mapping
+
+Prefer:
+
+Raw Exception
+      ↓
+Application Error
+      ↓
+Error Classification
+      ↓
+FastMCP Adapter
+      ↓
+MCP Response
+
+This gives the application a stable error contract even if framework behavior changes.
+
+⸻
+
+4. Protocol Error vs Tool Execution Error
+
+This remains the most important distinction.
+
+4.1 Protocol Error
+
+A protocol error means the MCP request itself cannot be correctly processed.
+
+Examples:
+
+Malformed JSON
+Invalid JSON-RPC request
+Unsupported MCP method
+Invalid MCP request structure
+Protocol-level parameter failure
+Unexpected framework/server failure
+
+These belong to:
+
+MCP / JSON-RPC
+Protocol Error
+
+and are generally handled by:
+
+FastMCP
++
+MCP Python SDK
+
+Normal business failures should not be manually converted into protocol errors.
+
+⸻
+
+4.2 Tool Execution Error
+
+A Tool Execution Error occurs when:
+
+The MCP request is valid, the tool exists, and the tool invocation reaches the application, but the requested operation cannot complete successfully.
+
+Examples:
+
+Account does not exist
+Invalid business identifier
+Upstream API unavailable
+Upstream timeout
+Rate limit reached
+Business rule violation
+Requested data unavailable
+
+With FastMCP 3.4.5, the recommended application flow is usually:
+
+Application Error
+      ↓
+FastMCP ToolError
+      ↓
+Tool Execution Error
+      ↓
+isError = true
+
+FastMCP should handle the low-level MCP tool-result construction.
+
+⸻
+
+5. Parameter Errors Must Be Separated Into Two Types
+
+“Parameter Error” is too broad to be treated as one category.
+
+There are two different failure classes.
+
+5.1 Structural / Type Validation Error
+
+Example tool:
+
+@mcp.tool
+def get_holdings(
+    account_id: str,
+    limit: int
+):
+    ...
+
+Client sends:
+
+{
+  "account_id": "123",
+  "limit": "not-an-int"
+}
+
+FastMCP can use the Python signature and generated schema to perform structural or type validation.
+
+This belongs to:
+
+Framework / Schema Validation
+
+FastMCP should generally handle this layer.
+
+The application should not duplicate all framework validation unless additional business validation is needed.
+
+⸻
+
+5.2 Tool Semantic Parameter Error
+
+Now consider:
+
+{
+  "account_id": "ABC123",
+  "limit": 10
+}
+
+The types are valid.
+
+But the application discovers:
+
+ABC123 does not exist
+
+This is not a protocol error.
+
+It is:
+
+Tool Execution Error
+      ↓
+Domain Validation Error
+      ↓
+Application ValidationError
+      ↓
+FastMCP ToolError
+
+Example:
+
+raise ValidationError(
+    "Account does not exist."
+)
+
+At the FastMCP boundary:
+
+except ValidationError as exc:
+    raise ToolError(str(exc))
+
+This gives the model actionable feedback so it can correct the parameter or ask the user.
+
+⸻
+
+6. Recommended Application Exception Hierarchy
+
+The application should define its own error hierarchy.
+
+Business logic should not depend directly on ToolError.
+
+Example:
+
+class AppError(Exception):
+    code = "APP_ERROR"
+    retryable = False
+    user_safe = True
+class ValidationError(AppError):
+    code = "VALIDATION_ERROR"
+class BusinessError(AppError):
+    code = "BUSINESS_ERROR"
+class UpstreamError(AppError):
+    code = "UPSTREAM_ERROR"
+    retryable = True
+class UpstreamTimeoutError(
+    UpstreamError
+):
+    code = "UPSTREAM_TIMEOUT"
+class RateLimitError(
+    UpstreamError
+):
+    code = "UPSTREAM_RATE_LIMIT"
+class InternalError(AppError):
+    code = "INTERNAL_ERROR"
+    retryable = False
+    user_safe = False
+
+The intended separation is:
+
+Implementation Exception
+      ↓
+Application Error
+      ↓
+FastMCP Mapping
+
+For example:
+
+httpx.TimeoutException
+      ↓
+UpstreamTimeoutError
+      ↓
+ToolError
+
+Business logic should not know or care how FastMCP serializes the final MCP error.
+
+⸻
+
+7. Normalize Dependency Errors
+
+External dependencies should never define the public error contract of an MCP tool.
+
+Avoid exposing:
+
+HTTPStatusError
+TimeoutError
+DatabaseError
+VendorSDKError
+
+directly to FastMCP.
+
+Instead normalize them.
+
+Example:
+
+try:
+    response = await upstream.get(
+        url
+    )
+    response.raise_for_status()
+except TimeoutError as exc:
+    raise UpstreamTimeoutError() \
+        from exc
+except HTTPStatusError as exc:
+    status = (
+        exc.response.status_code
+    )
+    if status == 429:
+        raise RateLimitError() \
+            from exc
+    if status >= 500:
+        raise UpstreamError() \
+            from exc
+    raise
+
+Recommended flow:
+
+Vendor Failure
+      ↓
+Raw Dependency Exception
+      ↓
+Application Error
+      ↓
+Retry Policy
+      ↓
+FastMCP ToolError
+
+Examples:
+
+HTTP 429
+   ↓
+RateLimitError
+   ↓
+retryable = true
+HTTP 503
+   ↓
+UpstreamError
+   ↓
+retryable = true
+
+FastMCP should not be responsible for interpreting vendor-specific semantics.
+
+⸻
+
+8. Recommended Tool Error Contract
+
+Even when FastMCP uses ToolError, the application should maintain a consistent logical error contract.
+
+Recommended fields:
+
+code
+category
+message
+retryable
+action
+correlation_id
+
+A conceptual payload may look like:
+
+{
+  "error": {
+    "code": "UPSTREAM_TIMEOUT",
+    "category": "upstream",
+    "message": "The account service timed out.",
+    "retryable": true,
+    "action": "retry",
+    "correlation_id": "abc-123"
+  }
+}
+
+Possible categories:
+
+validation
+business
+upstream
+internal
+
+Possible actions:
+
+retry
+correct_parameter
+ask_user
+authenticate
+inform_user
+contact_support
+
+FastMCP may serialize the error differently, but these semantics should remain stable inside the application.
+
+⸻
+
+9. Example Error Contracts
+
+9.1 Invalid Parameter
+
+{
+  "error": {
+    "code": "INVALID_ACCOUNT_ID",
+    "category": "validation",
+    "message": "The supplied account_id is invalid.",
+    "retryable": false,
+    "action": "correct_parameter"
+  }
+}
+
+9.2 Account Not Found
+
+{
+  "error": {
+    "code": "ACCOUNT_NOT_FOUND",
+    "category": "validation",
+    "message": "No account was found.",
+    "retryable": false,
+    "action": "correct_parameter"
+  }
+}
+
+9.3 Business Rule Failure
+
+{
+  "error": {
+    "code": "ACCOUNT_NOT_ELIGIBLE",
+    "category": "business",
+    "message": "This account does not support holdings retrieval.",
+    "retryable": false,
+    "action": "inform_user"
+  }
+}
+
+9.4 Upstream Timeout
+
+{
+  "error": {
+    "code": "UPSTREAM_TIMEOUT",
+    "category": "upstream",
+    "message": "The holdings service timed out.",
+    "retryable": true,
+    "action": "retry"
+  }
+}
+
+9.5 Upstream Rate Limit
+
+{
+  "error": {
+    "code": "UPSTREAM_RATE_LIMIT",
+    "category": "upstream",
+    "message": "The upstream service is temporarily rate limited.",
+    "retryable": true,
+    "action": "retry"
+  }
+}
+
+9.6 Internal Error
+
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "category": "internal",
+    "message": "The request could not be completed.",
+    "retryable": false,
+    "action": "inform_user",
+    "correlation_id": "abc-456"
+  }
+}
+
+⸻
+
+10. Retry Strategy
+
+Retry behavior should not be based only on whether an exception occurred.
+
+Ask:
+
+If exactly the same request is executed again later, is there a reasonable possibility that it will succeed?
+
+10.1 Generally Retryable
+
+HTTP 429
+HTTP 502
+HTTP 503
+HTTP 504
+Connection reset
+Temporary network failure
+Upstream timeout
+Database deadlock
+Temporary service unavailable
+
+10.2 Generally Not Retryable
+
+Invalid parameter
+Missing business parameter
+Account not found
+Permission denied
+Business rule violation
+Invalid authentication
+Programming error
+Unexpected KeyError
+Unexpected NoneType failure
+
+10.3 Retryability Matrix
+
+Missing parameter
+Retry: No
+Action: Correct parameter
+Invalid account ID
+Retry: No
+Action: Correct parameter
+Account not found
+Retry: No
+Action: Ask user / change parameter
+Business rule violation
+Retry: No
+Action: Inform user
+HTTP 429
+Retry: Yes
+Action: Retry with backoff
+HTTP 502 / 503 / 504
+Retry: Yes
+Action: Retry with backoff
+Upstream timeout
+Retry: Yes
+Action: Retry with backoff
+DB deadlock
+Retry: Usually
+Action: Retry
+Permission denied
+Retry: No
+Action: Correct authorization
+Authentication failure
+Retry: Usually no
+Action: Re-authenticate
+Unexpected programming error
+Retry: No
+Action: Internal investigation
+
+⸻
+
+11. Retry Should Usually Occur Inside the Server First
+
+Infrastructure retries should usually not be delegated immediately to the LLM.
+
+Avoid:
+
+Tool
+ ↓
+Upstream timeout
+ ↓
+ToolError
+ ↓
+LLM retries tool
+
+Prefer:
+
+Tool
+ ↓
+Upstream call
+ ↓
+Timeout
+ ↓
+Server retry #1
+ ↓
+Server retry #2
+ ↓
+Still failed
+ ↓
+UpstreamError
+ ↓
+ToolError
+ ↓
+Model decides next action
+
+Recommended retry strategy:
+
+bounded retry
++
+exponential backoff
++
+jitter
+
+For example:
+
+MAX_RETRIES = 2
+
+If FastMCP middleware is used for retries, apply retry behavior only to explicitly classified transient errors.
+
+Do not use global retry behavior that retries every exception.
+
+FastMCP retry middleware can be useful for cross-cutting retry policy, but the retry condition should still be driven by application semantics.
+
+⸻
+
+12. Timeout Management
+
+Every external dependency should have an explicit timeout.
+
+Avoid:
+
+result = await call_upstream()
+
+without a timeout policy.
+
+Prefer:
+
+result = await asyncio.wait_for(
+    call_upstream(),
+    timeout=10,
+)
+
+or configure the HTTP client directly.
+
+Example:
+
+Timeout(
+    connect=2,
+    read=8,
+    write=5,
+)
+
+FastMCP tool-level timeout support can also be used as a higher-level safeguard.
+
+The two timeout layers serve different purposes:
+
+Dependency Timeout
+→ controls vendor/API call duration
+Tool Timeout
+→ controls total tool execution duration
+
+Without explicit timeouts:
+
+Upstream hangs
+   ↓
+Tool hangs
+   ↓
+FastMCP request hangs
+   ↓
+MCP request hangs
+   ↓
+Client eventually times out
+
+This makes root-cause diagnosis harder.
+
+⸻
+
+13. Internal Errors Must Be Sanitized
+
+Avoid:
+
+except Exception as exc:
+    raise ToolError(str(exc))
+
+This may expose:
+
+Database hostnames
+Internal URLs
+SQL statements
+Table names
+Stack traces
+File paths
+AWS resources
+Vendor endpoints
+Customer identifiers
+Token fragments
+Implementation details
+
+Instead separate:
+
+Server Diagnostics
+
+from:
+
+Client-Visible Error
+
+Example:
+
+except Exception:
+    error_id = str(
+        uuid.uuid4()
+    )
+    logger.exception(
+        "Unexpected MCP tool error",
+        extra={
+            "error_id": error_id
+        }
+    )
+    raise ToolError(
+        "Unable to complete the "
+        f"request. Reference: "
+        f"{error_id}"
+    )
+
+FastMCP’s error masking behavior should also be configured intentionally.
+
+A setting such as:
+
+mask_error_details = true
+
+is useful as a framework-level safety net.
+
+However, it should not replace application-level sanitization.
+
+The application should still record internally that the failure was:
+
+category = internal
+expected = false
+
+⸻
+
+14. Logging Recommendation
+
+Server logs should contain enough information for debugging.
+
+Recommended fields:
+
+timestamp
+correlation_id
+request_id
+tool_name
+error_category
+error_code
+exception_type
+upstream_service
+retry_count
+latency
+stack_trace
+
+Client-visible errors should contain only safe information:
+
+error code
+safe message
+retryability
+recommended action
+correlation ID
+
+Example:
+
+SERVER LOG
+--------------------
+error_id:
+123456
+tool:
+get_holdings
+category:
+internal
+exception:
+KeyError
+stack_trace:
+...
+upstream_service:
+account-api
+CLIENT / MODEL
+--------------------
+code:
+INTERNAL_ERROR
+message:
+Unable to complete request.
+retryable:
+false
+correlation_id:
+123456
+
+FastMCP middleware can be used to centralize logging and observability.
+
+For example:
+
+ErrorHandlingMiddleware
+Logging Middleware
+Tracing Middleware
+
+can provide consistent cross-tool behavior.
+
+Middleware should supplement, not replace, application error classification.
+
+⸻
+
+15. Recommended Error Handling Flow
+
+A standardized FastMCP tool should conceptually follow this flow:
+
+Tool Request
+     │
+     ▼
+FastMCP Structural
+Validation
+     │
+     ▼
+Application Semantic
+Validation
+     │
+     ├── Invalid
+     │      ↓
+     │ ValidationError
+     │
+     ▼
+Business Logic
+     │
+     ├── Failure
+     │      ↓
+     │ BusinessError
+     │
+     ▼
+Dependency Layer
+     │
+     ├── Timeout
+     │      ↓
+     │ UpstreamTimeoutError
+     │
+     ├── HTTP 429
+     │      ↓
+     │ RateLimitError
+     │
+     └── HTTP 5xx
+            ↓
+       UpstreamError
+            │
+            ▼
+      FastMCP Adapter
+            │
+      ┌─────┴─────┐
+      │           │
+      ▼           ▼
+ Expected       Unexpected
+ Failure         Failure
+      │           │
+      ▼           ▼
+  ToolError   Log Full Error
+      │           │
+      │           ▼
+      │      Sanitize Error
+      │           │
+      └──────┬────┘
+             ▼
+        MCP Client
+
+Cross-cutting behavior may be implemented through middleware:
+
+Retry Middleware
+Error Middleware
+Logging Middleware
+Metrics / Tracing
+
+but error semantics should still originate from the application layer.
+
+⸻
+
+16. Example Implementation Pattern
+
+A recommended pattern is:
+
+@mcp.tool
+async def get_holdings(
+    account_id: str
+):
+    try:
+        return await (
+            holdings_service
+            .get_holdings(
+                account_id
+            )
+        )
+    except ValidationError as exc:
+        raise ToolError(
+            str(exc)
+        )
+    except BusinessError as exc:
+        raise ToolError(
+            str(exc)
+        )
+    except RateLimitError:
+        raise ToolError(
+            "The upstream service "
+            "is temporarily rate "
+            "limited. Retry later."
+        )
+    except UpstreamTimeoutError:
+        raise ToolError(
+            "The holdings service "
+            "timed out. Retry the "
+            "request."
+        )
+    except UpstreamError:
+        raise ToolError(
+            "The holdings service "
+            "is temporarily "
+            "unavailable."
+        )
+    except Exception:
+        correlation_id = (
+            generate_correlation_id()
+        )
+        logger.exception(
+            "Unexpected "
+            "get_holdings failure",
+            extra={
+                "correlation_id":
+                    correlation_id
+            }
+        )
+        raise ToolError(
+            "Unable to complete the "
+            "request. Reference: "
+            f"{correlation_id}"
+        )
+
+The business layer should remain independent of FastMCP.
+
+Example:
+
+async def load_holdings(
+    account_id: str
+):
+    if not account_exists(
+        account_id
+    ):
+        raise ValidationError(
+            "Account does not exist."
+        )
+    try:
+        return await (
+            upstream
+            .get_holdings(
+                account_id
+            )
+        )
+    except TimeoutError as exc:
+        raise (
+            UpstreamTimeoutError()
+        ) from exc
+
+This keeps FastMCP-specific code at the boundary.
+
+For larger applications, this mapping can be centralized in:
+
+decorator
+wrapper
+middleware
+error adapter
+
+rather than repeated in every tool.
+
+⸻
+
+17. FastMCP vs Low-Level Server
+
+When using FastMCP 3.4.5, most tool-level application code should rely on FastMCP’s higher-level abstractions.
+
+However, developers should still understand the distinction between:
+
+FastMCP Framework
+
+and:
+
+MCP Python SDK
+
+FastMCP may:
+
+Catch exception
+   ↓
+Convert exception
+   ↓
+Generate Tool Error
+   ↓
+Produce MCP result
+
+while lower-level MCP SDK handlers may expose different propagation behavior.
+
+Therefore internal engineering documentation should state:
+
+Application error semantics must not depend on implicit FastMCP or MCP SDK exception conversion behavior.
+
+Use:
+
+Application Error
+      ↓
+FastMCP Error Adapter
+      ↓
+Framework
+
+instead of:
+
+Business Logic
+      ↓
+ToolError everywhere
+
+This is especially important for future framework or SDK upgrades.
+
+⸻
+
+18. outputSchema Error-Path Testing
+
+Structured tool output should be tested carefully.
+
+A tool may define:
+
+input schema
+output schema
+
+FastMCP may handle schema generation and result validation.
+
+The success path may work correctly while error paths behave differently.
+
+Therefore test:
+
+Success
+Structural validation error
+Semantic validation error
+Business error
+Upstream timeout
+Upstream 5xx
+Unexpected internal error
+
+Do not test only the happy path.
+
+Also verify that:
+
+ToolError
+
+or another error-path result is not unexpectedly replaced by structured-output validation behavior.
+
+If structured output is heavily used, add regression tests specifically for:
+
+isError behavior
+error serialization
+schema validation ordering
+masked error behavior
+
+⸻
+
+19. Common Anti-Patterns
+
+Anti-Pattern 1:
+
+Convert Everything to ToolError
+
+Avoid:
+
+except Exception as exc:
+    raise ToolError(str(exc))
+
+Problems:
+
+Validation errors
+Business errors
+Dependency failures
+Programming bugs
+
+all become indistinguishable.
+
+It may also expose sensitive information.
+
+⸻
+
+Anti-Pattern 2:
+
+Use ToolError Inside Business Logic
+
+Avoid:
+
+async def service():
+    raise ToolError(
+        "Account not found."
+    )
+
+This tightly couples the service layer to FastMCP.
+
+Prefer:
+
+async def service():
+    raise ValidationError(
+        "Account not found."
+    )
+
+Then map it at the MCP boundary.
+
+⸻
+
+Anti-Pattern 3:
+
+Return Generic Strings
+
+Avoid:
+
+except Exception:
+    return "Something went wrong"
+
+The model cannot determine:
+
+What failed?
+Should I retry?
+Should I change parameters?
+Should I ask the user?
+
+Use structured application semantics.
+
+⸻
+
+Anti-Pattern 4:
+
+Expose HTTP Errors Directly
+
+Avoid:
+
+except HTTPError as exc:
+    raise ToolError(str(exc))
+
+Normalize upstream errors first.
+
+⸻
+
+Anti-Pattern 5:
+
+Retry Every Exception
+
+Avoid:
+
+except Exception:
+    retry()
+
+This may retry:
+
+Invalid parameters
+Permission errors
+Business failures
+Programming bugs
+
+Retry only explicitly classified transient failures.
+
+⸻
+
+Anti-Pattern 6:
+
+Expose Stack Traces
+
+Do not return:
+
+Traceback ...
+KeyError ...
+/internal/path/service.py ...
+
+to the MCP client.
+
+Keep detailed diagnostics server-side.
+
+⸻
+
+Anti-Pattern 7:
+
+Rely Only on mask_error_details
+
+Error masking is a useful framework-level protection.
+
+It should not replace:
+
+application classification
+safe messages
+correlation IDs
+logging
+retry policy
+
+Treat error masking as defense in depth.
+
+⸻
+
+Anti-Pattern 8:
+
+Use Global Retry Middleware Without Filtering
+
+Avoid retry middleware that retries every exception.
+
+A retry layer should distinguish:
+
+transient upstream failure
+
+from:
+
+validation failure
+business rule failure
+authorization failure
+programming bug
+
+⸻
+
+20. Recommended Decision Matrix
+
+Malformed JSON
+Category:
+Protocol
+Handled by:
+FastMCP / MCP SDK
+Retry:
+No
+Invalid MCP request
+Category:
+Protocol
+Handled by:
+FastMCP / MCP SDK
+Retry:
+No
+Structural type error
+Category:
+Schema Validation
+Handled by:
+FastMCP
+Retry:
+Correct input
+Invalid semantic parameter
+Category:
+Tool Validation
+Application mapping:
+ValidationError
+→ ToolError
+Retry:
+Correct parameter
+Account not found
+Category:
+Tool Validation
+Application mapping:
+ValidationError
+→ ToolError
+Retry:
+Correct parameter
+Business rule failure
+Category:
+Tool Business
+Application mapping:
+BusinessError
+→ ToolError
+Retry:
+No
+HTTP 429
+Category:
+Tool Upstream
+Application mapping:
+RateLimitError
+→ internal retry
+→ ToolError if exhausted
+Retry:
+Yes
+HTTP 502 / 503 / 504
+Category:
+Tool Upstream
+Application mapping:
+UpstreamError
+→ internal retry
+→ ToolError if exhausted
+Retry:
+Yes
+Upstream timeout
+Category:
+Tool Upstream
+Application mapping:
+UpstreamTimeoutError
+→ internal retry
+→ ToolError if exhausted
+Retry:
+Yes
+Authentication failure
+Category:
+Auth
+Handled by:
+Authentication layer
+Retry:
+Usually no
+Authorization failure
+Category:
+Auth
+Handled by:
+Authorization layer
+Retry:
+No
+Unexpected Python bug
+Category:
+Internal
+Handling:
+Log full error
++
+sanitize
++
+generic ToolError
+or framework error
+Retry:
+No
+
+⸻
+
+21. Recommended Development Standards for FastMCP 3.4.5 + MCP SDK 1.x
+
+1. Pin Both Framework and SDK Versions
+
+Example:
+
+fastmcp==3.4.5
+mcp>=1.28,<2
+
+Avoid accidental behavior changes caused by major framework or SDK upgrades.
+
+⸻
+
+2. Do Not Depend on Implicit Exception Mapping
+
+Application behavior should not depend on how FastMCP or MCP SDK internally converts Python exceptions.
+
+⸻
+
+3. Define an Application Error Hierarchy
+
+At minimum:
+
+ValidationError
+BusinessError
+UpstreamError
+UpstreamTimeoutError
+RateLimitError
+InternalError
+
+⸻
+
+4. Keep FastMCP Types at the Boundary
+
+Business logic should raise:
+
+ValidationError
+BusinessError
+UpstreamError
+
+not:
+
+ToolError
+
+ToolError should normally be created at the MCP-facing adapter layer.
+
+⸻
+
+5. Let FastMCP Handle Structural Validation
+
+Use Python signatures and type annotations for structural validation.
+
+Do not duplicate framework validation unless additional business validation is required.
+
+⸻
+
+6. Normalize Semantic and Dependency Failures
+
+Convert expected failures into stable application errors before translating them into FastMCP errors.
+
+⸻
+
+7. Reserve Protocol Errors for Protocol Failures
+
+Do not convert ordinary business or dependency failures into JSON-RPC errors simply because an exception occurred.
+
+⸻
+
+8. Implement Explicit Retry Policies
+
+Use:
+
+bounded retry
+exponential backoff
+jitter
+
+for explicitly classified transient failures.
+
+FastMCP retry middleware may be used when appropriate, but retry rules must be filtered by error semantics.
+
+⸻
+
+9. Implement Explicit Timeouts
+
+Every network or external dependency call should have an explicit timeout.
+
+Tool-level timeout should be considered an additional safeguard, not a replacement for dependency-specific timeout configuration.
+
+⸻
+
+10. Sanitize Internal Errors
+
+Detailed exceptions belong in logs.
+
+Client-visible messages should remain safe and stable.
+
+Use framework-level error masking as an additional protection layer.
+
+⸻
+
+11. Add Correlation IDs
+
+Unexpected errors should include a correlation or reference ID that can be matched with server logs.
+
+⸻
+
+12. Centralize Cross-Cutting Handling Where Appropriate
+
+FastMCP middleware can be useful for:
+
+error logging
+metrics
+tracing
+retry
+standardized error transformation
+
+But middleware should operate on an already-defined application error model.
+
+⸻
+
+13. Test Error Paths
+
+Each tool should test at minimum:
+
+Success
+Structural validation failure
+Semantic validation failure
+Business failure
+Upstream timeout
+Upstream 5xx
+Retry exhausted
+Unexpected exception
+Masked error behavior
+
+If using structured output or output schemas, test error responses separately.
+
+⸻
+
+22. Designing for Future MCP SDK 2.x Migration
+
+A recommended architecture is:
+
+Business Logic
+      │
+      ▼
+Application Errors
+      │
+      ├── ValidationError
+      ├── BusinessError
+      ├── UpstreamError
+      └── InternalError
+      │
+      ▼
+FastMCP /
+MCP Adapter
+      │
+      ├── Current:
+      │   FastMCP 3.4.5
+      │   + MCP SDK 1.x
+      │
+      └── Future:
+          MCP SDK 2.x
+          or updated FastMCP
+
+The application-level errors remain stable.
+
+Only the adapter layer should change.
+
+For example:
+
+UpstreamTimeoutError
+
+remains the same application concept regardless of framework version.
+
+This reduces future migration effort.
+
+The target should be:
+
+Business Logic
+does not care
+which MCP version
+or framework is used.
+
+⸻
+
+23. Summary
+
+Most MCP SDK 1.x error-handling recommendations remain valid when FastMCP 3.4.5 is added.
+
+The main difference is implementation responsibility.
+
+Without FastMCP:
+
+Application
+   ↓
+MCP SDK
+
+With FastMCP:
+
+Application
+   ↓
+FastMCP
+   ↓
+MCP SDK
+
+Therefore:
+
+Expected Tool Failure
+      ↓
+Application Error
+      ↓
+FastMCP ToolError
+      ↓
+MCP Tool Error
+
+while:
+
+Unexpected Internal Failure
+      ↓
+Full Server Logging
+      ↓
+Sanitization
+      ↓
+Safe Client Error
+
+Framework-native capabilities such as:
+
+ToolError
+mask_error_details
+tool timeout
+ErrorHandlingMiddleware
+RetryMiddleware
+
+are useful and should be used where appropriate.
+
+However, they should sit around a stable application-level error model rather than replacing one.
+
+The core recommendation is:
+
+Use FastMCP as the MCP-facing error adapter, not as the application’s business error model.
+
+The preferred architecture is:
+
+Raw Exception
+      ↓
+Application Error
+      ↓
+Classification
+      ↓
+Retry / Logging Policy
+      ↓
+FastMCP Adapter
+      ↓
+MCP Response
+
+This provides:
+
+Consistent tool behavior
+Better LLM recovery
+Clearer observability
+Less framework coupling
+Lower future migration cost
+
+In short:
+
+Do not make FastMCP 3.4.5
+or MCP SDK 1.x implicit
+exception behavior your
+application's error-handling
+architecture.
+Build a stable application
+error contract above both.
