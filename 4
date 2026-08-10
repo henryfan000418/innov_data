@@ -1,0 +1,1436 @@
+# MCP Python SDK 1.x Error Handling Guidelines
+
+## 1. Purpose
+
+This document provides recommended error-handling practices for applications built with **MCP Python SDK 1.x**, particularly when using FastMCP or the low-level MCP Server APIs.
+
+The recommendations are informed by the clearer error-handling boundaries introduced in MCP SDK 2.x and are intended to address several engineering risks present when developing with SDK 1.x:
+
+- Implicit exception-to-MCP-error conversion
+- Inconsistent error behavior across different SDK layers
+- Ambiguous separation between protocol errors and tool execution errors
+- Lack of standardized application-level error contracts
+- Inconsistent retry behavior
+- Leakage of internal implementation details
+- Dependency and upstream error propagation
+- Future migration complexity from SDK 1.x to 2.x
+
+The primary recommendation is:
+
+> **Do not rely on MCP SDK 1.x implicit exception handling as the application's error contract.**
+>
+> Applications should implement an explicit error abstraction layer that classifies, normalizes, logs, and maps errors into appropriate MCP responses.
+
+---
+
+# 2. Recommended Error Taxonomy
+
+MCP Server errors should be divided into four major categories:
+
+```text
+MCP Server Error
+│
+├── 1. Transport Error
+│
+├── 2. Authentication / Authorization Error
+│
+├── 3. MCP / JSON-RPC Protocol Error
+│
+└── 4. Tool Execution Error
+      │
+      ├── Parameter / Domain Validation Error
+      ├── Business Logic Error
+      ├── Upstream / Dependency Error
+      └── Expected Runtime Error
+```
+
+These categories represent different failure layers and should not be handled identically.
+
+---
+
+# 3. Key Limitation of MCP SDK 1.x
+
+One of the primary risks of SDK 1.x is relying on implicit SDK exception handling.
+
+For example:
+
+```python
+@mcp.tool()
+async def get_account(account_id: str):
+    if not account_id:
+        raise ValueError("account_id is required")
+```
+
+Developers should **not assume** that:
+
+```text
+ValueError
+    ↓
+Parameter Error
+    ↓
+isError = true
+```
+
+will always be the resulting behavior.
+
+Depending on:
+
+- FastMCP vs low-level Server
+- Handler type
+- Where the exception occurs
+- SDK implementation behavior
+- Validation stage
+
+the exception may be converted differently.
+
+Therefore, avoid the following architecture:
+
+```text
+Python Exception
+       ↓
+MCP SDK
+       ↓
+Implicit Error Mapping
+```
+
+Instead use:
+
+```text
+Python / Dependency Exception
+             ↓
+     Application Error Layer
+             ↓
+       Error Classification
+             ↓
+         Error Mapper
+             ↓
+        MCP Response
+```
+
+This ensures that application error semantics do not depend on internal SDK behavior.
+
+---
+
+# 4. Protocol Error vs Tool Execution Error
+
+This is the most important distinction in MCP error handling.
+
+## 4.1 Protocol Error
+
+A protocol error means the **MCP request itself cannot be correctly processed**.
+
+Examples include:
+
+- Malformed JSON
+- Invalid JSON-RPC request
+- Unsupported MCP method
+- Invalid MCP request structure
+- Protocol-level parameter validation failure
+- Unexpected MCP server internal failure
+
+These errors should normally be represented as:
+
+```text
+JSON-RPC Error Response
+```
+
+For example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params"
+  }
+}
+```
+
+---
+
+## 4.2 Tool Execution Error
+
+A Tool Execution Error occurs when:
+
+> The MCP request is valid and the requested tool exists, but the tool cannot successfully complete the requested operation.
+
+Examples:
+
+```text
+Account does not exist
+Invalid business identifier
+Upstream API unavailable
+Upstream timeout
+Rate limit reached
+Business rule violation
+Requested data unavailable
+```
+
+These errors should generally be exposed as:
+
+```text
+CallToolResult
+    ↓
+isError = true
+```
+
+This distinction is important because tool errors are visible to the model and can provide actionable feedback.
+
+---
+
+# 5. Parameter Errors Must Be Separated Into Two Types
+
+"Parameter Error" is too broad to be treated as a single category.
+
+There are two fundamentally different parameter failures.
+
+---
+
+## 5.1 Protocol / Schema Parameter Error
+
+Example:
+
+```json
+{
+  "method": "tools/call",
+  "params": "hello"
+}
+```
+
+If `params` is expected to be an object, this request does not conform to the MCP request structure.
+
+This should be classified as:
+
+```text
+Protocol Error
+    ↓
+JSON-RPC Error
+```
+
+For example:
+
+```text
+-32602 Invalid Params
+```
+
+---
+
+## 5.2 Tool Semantic Parameter Error
+
+Consider a valid request:
+
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "get_account",
+    "arguments": {
+      "account_id": "ABC123"
+    }
+  }
+}
+```
+
+The JSON structure is valid.
+
+The tool schema may also say:
+
+```json
+{
+  "account_id": {
+    "type": "string"
+  }
+}
+```
+
+Therefore:
+
+```text
+"ABC123"
+```
+
+is structurally valid.
+
+However, the application may determine that account `ABC123` does not exist.
+
+This is **not a protocol error**.
+
+It should be:
+
+```text
+Tool Execution Error
+    ↓
+Validation / Domain Error
+    ↓
+isError = true
+```
+
+For example:
+
+```json
+{
+  "error": {
+    "code": "ACCOUNT_NOT_FOUND",
+    "category": "validation",
+    "message": "No account was found for the supplied account_id.",
+    "retryable": false,
+    "action": "correct_parameter"
+  }
+}
+```
+
+This allows the model to understand that it should obtain or provide a different account identifier.
+
+---
+
+# 6. Recommended Application Exception Hierarchy
+
+Applications should define their own error hierarchy instead of directly exposing implementation-level exceptions.
+
+Example:
+
+```python
+class AppError(Exception):
+    """Base application error."""
+
+    code: str = "APP_ERROR"
+    retryable: bool = False
+    user_safe: bool = True
+
+
+class ValidationError(AppError):
+    code = "VALIDATION_ERROR"
+
+
+class BusinessError(AppError):
+    code = "BUSINESS_ERROR"
+
+
+class UpstreamError(AppError):
+    code = "UPSTREAM_ERROR"
+    retryable = True
+
+
+class UpstreamTimeoutError(UpstreamError):
+    code = "UPSTREAM_TIMEOUT"
+
+
+class RateLimitError(UpstreamError):
+    code = "UPSTREAM_RATE_LIMIT"
+
+
+class InternalError(AppError):
+    code = "INTERNAL_ERROR"
+    retryable = False
+    user_safe = False
+```
+
+The purpose of this hierarchy is to separate:
+
+```text
+Implementation Exceptions
+```
+
+from:
+
+```text
+Application Error Semantics
+```
+
+For example:
+
+```text
+httpx.TimeoutException
+        ↓
+UpstreamTimeoutError
+        ↓
+UPSTREAM_TIMEOUT
+```
+
+Instead of exposing:
+
+```text
+httpx.TimeoutException
+```
+
+directly to the MCP client.
+
+---
+
+# 7. Normalize Dependency Errors
+
+External dependencies should never define the public error contract of an MCP tool.
+
+Suppose a tool calls an upstream REST API:
+
+```python
+response = await client.get(url)
+response.raise_for_status()
+```
+
+Avoid exposing:
+
+```text
+HTTPStatusError: 503 Service Unavailable
+```
+
+directly to the MCP client.
+
+Instead normalize dependency errors:
+
+```python
+try:
+    response = await upstream.get(url)
+    response.raise_for_status()
+
+except TimeoutError as exc:
+    raise UpstreamTimeoutError() from exc
+
+except HTTPStatusError as exc:
+
+    if exc.response.status_code == 429:
+        raise RateLimitError() from exc
+
+    if exc.response.status_code >= 500:
+        raise UpstreamError() from exc
+
+    raise
+```
+
+This creates a stable abstraction:
+
+```text
+External Dependency
+        ↓
+Raw Dependency Error
+        ↓
+Application Error
+        ↓
+MCP Error Contract
+```
+
+For example:
+
+```text
+HTTP 429
+    ↓
+RateLimitError
+    ↓
+UPSTREAM_RATE_LIMIT
+    ↓
+retryable = true
+```
+
+and:
+
+```text
+HTTP 503
+    ↓
+UpstreamError
+    ↓
+UPSTREAM_UNAVAILABLE
+    ↓
+retryable = true
+```
+
+---
+
+# 8. Recommended Tool Error Contract
+
+All tools should use a consistent error structure.
+
+Recommended format:
+
+```json
+{
+  "error": {
+    "code": "UPSTREAM_TIMEOUT",
+    "category": "upstream",
+    "message": "The account service did not respond in time.",
+    "retryable": true,
+    "action": "retry",
+    "correlation_id": "abc-123"
+  }
+}
+```
+
+Recommended fields:
+
+| Field | Description |
+|---|---|
+| `code` | Stable machine-readable application error code |
+| `category` | High-level error category |
+| `message` | Safe explanation for the model/client |
+| `retryable` | Whether repeating the same request may succeed |
+| `action` | Recommended next action |
+| `correlation_id` | Identifier used to correlate client failure with server logs |
+
+Possible categories:
+
+```text
+validation
+business
+upstream
+internal
+```
+
+Possible actions:
+
+```text
+retry
+correct_parameter
+ask_user
+authenticate
+inform_user
+contact_support
+```
+
+---
+
+# 9. Example Error Contracts
+
+## 9.1 Invalid Parameter
+
+```json
+{
+  "error": {
+    "code": "INVALID_ACCOUNT_ID",
+    "category": "validation",
+    "message": "The supplied account_id is invalid.",
+    "retryable": false,
+    "action": "correct_parameter"
+  }
+}
+```
+
+---
+
+## 9.2 Account Not Found
+
+```json
+{
+  "error": {
+    "code": "ACCOUNT_NOT_FOUND",
+    "category": "validation",
+    "message": "No account was found for the supplied account_id.",
+    "retryable": false,
+    "action": "correct_parameter"
+  }
+}
+```
+
+---
+
+## 9.3 Business Rule Failure
+
+```json
+{
+  "error": {
+    "code": "ACCOUNT_NOT_ELIGIBLE",
+    "category": "business",
+    "message": "This account does not support holdings retrieval.",
+    "retryable": false,
+    "action": "inform_user"
+  }
+}
+```
+
+---
+
+## 9.4 Upstream Timeout
+
+```json
+{
+  "error": {
+    "code": "UPSTREAM_TIMEOUT",
+    "category": "upstream",
+    "message": "The holdings service did not respond in time.",
+    "retryable": true,
+    "action": "retry"
+  }
+}
+```
+
+---
+
+## 9.5 Upstream Rate Limit
+
+```json
+{
+  "error": {
+    "code": "UPSTREAM_RATE_LIMIT",
+    "category": "upstream",
+    "message": "The upstream service is temporarily rate limited.",
+    "retryable": true,
+    "action": "retry"
+  }
+}
+```
+
+---
+
+## 9.6 Internal Error
+
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "category": "internal",
+    "message": "The request could not be completed.",
+    "retryable": false,
+    "action": "inform_user",
+    "correlation_id": "abc-456"
+  }
+}
+```
+
+---
+
+# 10. Retry Strategy
+
+Retry behavior should not be based only on whether an exception occurred.
+
+Instead ask:
+
+> If exactly the same request is executed again later, is there a reasonable possibility that it will succeed?
+
+---
+
+## 10.1 Generally Retryable
+
+Typical retryable errors include:
+
+```text
+HTTP 429
+HTTP 502
+HTTP 503
+HTTP 504
+Connection reset
+Temporary network failure
+Upstream timeout
+Database deadlock
+Temporary service unavailable
+```
+
+---
+
+## 10.2 Generally Not Retryable
+
+Typical non-retryable errors include:
+
+```text
+Invalid parameter
+Missing business parameter
+Account not found
+Permission denied
+Business rule violation
+Invalid authentication credentials
+Programming error
+Unexpected KeyError
+Unexpected NoneType failure
+```
+
+---
+
+## 10.3 Retryability Matrix
+
+| Error | Retryable | Recommended Action |
+|---|---:|---|
+| Missing parameter | No | Correct parameter |
+| Invalid account ID | No | Correct parameter |
+| Account not found | No | Change parameter / ask user |
+| Business rule violation | No | Inform user |
+| HTTP 429 | Yes | Retry with backoff |
+| HTTP 502 | Yes | Retry with backoff |
+| HTTP 503 | Yes | Retry with backoff |
+| HTTP 504 | Yes | Retry with backoff |
+| Upstream timeout | Yes | Retry with backoff |
+| DB deadlock | Usually | Retry |
+| Permission denied | No | Correct authorization |
+| Authentication failure | Usually no | Re-authenticate |
+| Unexpected `KeyError` | No | Internal investigation |
+| Unexpected programming exception | No | Internal investigation |
+
+---
+
+# 11. Retry Should Usually Occur Inside the Server First
+
+Infrastructure retries should generally not be delegated immediately to the LLM.
+
+Avoid:
+
+```text
+Tool
+ ↓
+Upstream timeout
+ ↓
+isError=true
+ ↓
+LLM
+ ↓
+Call Tool Again
+```
+
+Instead:
+
+```text
+Tool
+ ↓
+Upstream Call
+ ↓
+Timeout
+ ↓
+Server Retry #1
+ ↓
+Server Retry #2
+ ↓
+Still Failed
+ ↓
+Tool Error
+ ↓
+isError=true
+ ↓
+Model decides next action
+```
+
+This prevents unnecessary LLM orchestration for infrastructure-level transient failures.
+
+Recommended retry strategy:
+
+```text
+bounded retry
++
+exponential backoff
++
+jitter
+```
+
+For example:
+
+```python
+MAX_RETRIES = 2
+```
+
+Do not implement unlimited retries.
+
+---
+
+# 12. Timeout Management
+
+Every external dependency should have an explicit timeout.
+
+Avoid:
+
+```python
+result = await call_upstream()
+```
+
+without a timeout policy.
+
+Prefer:
+
+```python
+result = await asyncio.wait_for(
+    call_upstream(),
+    timeout=10,
+)
+```
+
+or configure HTTP clients with explicit timeouts:
+
+```python
+Timeout(
+    connect=2,
+    read=8,
+    write=5,
+)
+```
+
+Without explicit timeouts:
+
+```text
+Upstream Service Hangs
+        ↓
+Tool Hangs
+        ↓
+MCP Request Hangs
+        ↓
+Client Eventually Times Out
+```
+
+At that point it becomes difficult to determine whether the failure originated from:
+
+```text
+Transport
+MCP Server
+Tool
+Database
+Upstream API
+```
+
+Therefore timeout boundaries should be explicitly defined.
+
+---
+
+# 13. Internal Errors Must Be Sanitized
+
+Avoid:
+
+```python
+except Exception as exc:
+    return str(exc)
+```
+
+This may expose internal information such as:
+
+```text
+Database hostnames
+Internal URLs
+SQL statements
+Table names
+Stack traces
+File paths
+AWS resources
+Vendor endpoints
+Customer identifiers
+Token fragments
+Implementation details
+```
+
+Instead separate:
+
+```text
+Server-side diagnostics
+```
+
+from:
+
+```text
+Client-visible error
+```
+
+Example:
+
+```python
+except Exception:
+    error_id = str(uuid.uuid4())
+
+    logger.exception(
+        "Unexpected MCP tool error",
+        extra={
+            "error_id": error_id,
+            "tool": "get_holdings"
+        }
+    )
+
+    return tool_error(
+        code="INTERNAL_ERROR",
+        message="Unable to complete the request.",
+        retryable=False,
+        correlation_id=error_id,
+    )
+```
+
+---
+
+# 14. Logging Recommendation
+
+Server logs should contain sufficient information for debugging.
+
+Recommended fields:
+
+```text
+timestamp
+correlation_id
+request_id
+tool_name
+error_category
+error_code
+exception_type
+upstream_service
+retry_count
+latency
+stack_trace
+```
+
+Client responses should contain only safe information:
+
+```text
+error code
+safe message
+retryability
+recommended action
+correlation ID
+```
+
+Example:
+
+```text
+SERVER LOG
+────────────────────────────────
+
+error_id: 123456
+tool: get_holdings
+exception: KeyError
+stack_trace: ...
+upstream_service: account-api
+request_id: xyz
+
+
+CLIENT / MODEL
+────────────────────────────────
+
+code: INTERNAL_ERROR
+message: Unable to complete request.
+retryable: false
+correlation_id: 123456
+```
+
+---
+
+# 15. Recommended Error Handling Flow
+
+A standardized MCP tool should conceptually follow this flow:
+
+```text
+Tool Request
+      │
+      ▼
+Input Validation
+      │
+      ├── Invalid
+      │      ↓
+      │ ValidationError
+      │
+      ▼
+Business Logic
+      │
+      ├── Business Failure
+      │      ↓
+      │ BusinessError
+      │
+      ▼
+Dependency Layer
+      │
+      ├── Timeout
+      │      ↓
+      │ UpstreamTimeoutError
+      │
+      ├── HTTP 429
+      │      ↓
+      │ RateLimitError
+      │
+      └── HTTP 5xx
+             ↓
+        UpstreamError
+             │
+             ▼
+         Error Mapper
+             │
+       ┌─────┴─────┐
+       │           │
+       ▼           ▼
+ Expected       Unexpected
+ Failure         Failure
+       │           │
+       ▼           ▼
+ Tool Error    Internal Error
+ isError=true       │
+       │            ▼
+       │       Server Logging
+       │            +
+       │       Sanitization
+       │
+       ▼
+ Model Receives
+ Actionable Error
+```
+
+---
+
+# 16. Example Implementation Pattern
+
+A tool may follow this pattern:
+
+```python
+@mcp.tool()
+async def get_holdings(account_id: str):
+
+    try:
+        validate_account_id(account_id)
+
+        return await holdings_service.get_holdings(
+            account_id
+        )
+
+    except ValidationError as exc:
+
+        return tool_error(
+            code="INVALID_ACCOUNT_ID",
+            category="validation",
+            message=str(exc),
+            retryable=False,
+            action="correct_parameter",
+        )
+
+    except RateLimitError:
+
+        return tool_error(
+            code="UPSTREAM_RATE_LIMIT",
+            category="upstream",
+            message="The upstream service is temporarily rate limited.",
+            retryable=True,
+            action="retry",
+        )
+
+    except UpstreamTimeoutError:
+
+        return tool_error(
+            code="UPSTREAM_TIMEOUT",
+            category="upstream",
+            message="The holdings service timed out.",
+            retryable=True,
+            action="retry",
+        )
+
+    except UpstreamError:
+
+        return tool_error(
+            code="UPSTREAM_UNAVAILABLE",
+            category="upstream",
+            message="The holdings service is temporarily unavailable.",
+            retryable=True,
+            action="retry",
+        )
+
+    except Exception:
+
+        correlation_id = generate_correlation_id()
+
+        logger.exception(
+            "Unexpected get_holdings failure",
+            extra={
+                "correlation_id": correlation_id
+            }
+        )
+
+        return tool_error(
+            code="INTERNAL_ERROR",
+            category="internal",
+            message="Unable to complete the request.",
+            retryable=False,
+            action="inform_user",
+            correlation_id=correlation_id,
+        )
+```
+
+---
+
+# 17. FastMCP vs Low-Level Server
+
+MCP SDK 1.x applications should not assume that FastMCP and low-level Server APIs have identical exception behavior.
+
+For example:
+
+```python
+from mcp.server.fastmcp import FastMCP
+```
+
+and low-level APIs such as:
+
+```python
+from mcp.server import Server
+```
+
+operate at different abstraction layers.
+
+FastMCP may:
+
+```text
+Catch exception
+    ↓
+Convert exception
+    ↓
+Generate Tool Error
+```
+
+while low-level handlers may expose different exception propagation behavior.
+
+Therefore internal engineering documentation should explicitly state:
+
+> **Application error semantics must not depend on implicit MCP SDK exception conversion behavior.**
+
+Instead:
+
+```text
+Application Error
+      ↓
+Error Mapper
+      ↓
+MCP Adapter
+```
+
+This creates a stable contract regardless of the SDK abstraction layer.
+
+---
+
+# 18. `outputSchema` Error-Path Testing
+
+When using MCP SDK 1.x with structured tool output, special attention should be given to error paths.
+
+A tool may define:
+
+```text
+inputSchema
+outputSchema
+```
+
+The success path may work correctly while the error path behaves differently because output validation can interact with tool error responses.
+
+Therefore tools using `outputSchema` should explicitly test:
+
+```text
+Success
+Invalid Parameter
+Business Error
+Upstream Timeout
+Upstream 5xx
+Unexpected Internal Error
+```
+
+Do not validate only the happy path.
+
+---
+
+# 19. Common Anti-Patterns
+
+## Anti-Pattern 1: Convert Everything to ToolError
+
+Avoid:
+
+```python
+except Exception as exc:
+    raise ToolError(str(exc))
+```
+
+This collapses:
+
+```text
+Validation Error
+Business Error
+Dependency Error
+Programming Bug
+```
+
+into the same error category.
+
+It also risks exposing internal exception messages.
+
+---
+
+## Anti-Pattern 2: Return Generic Strings
+
+Avoid:
+
+```python
+except Exception:
+    return "Something went wrong"
+```
+
+The model cannot determine:
+
+```text
+What failed?
+Should I retry?
+Should I change parameters?
+Should I ask the user?
+```
+
+Use structured error metadata instead.
+
+---
+
+## Anti-Pattern 3: Expose HTTP Errors Directly
+
+Avoid:
+
+```python
+except HTTPError as exc:
+    return str(exc)
+```
+
+This couples the MCP contract to the upstream implementation and may leak infrastructure details.
+
+Normalize the error first.
+
+---
+
+## Anti-Pattern 4: Retry Every Exception
+
+Avoid:
+
+```python
+except Exception:
+    retry()
+```
+
+This may retry:
+
+```text
+Invalid parameters
+Permission errors
+Business failures
+Programming bugs
+```
+
+and can create retry storms.
+
+Retry only explicitly classified transient failures.
+
+---
+
+## Anti-Pattern 5: Expose Stack Traces
+
+Avoid returning:
+
+```text
+Traceback ...
+KeyError ...
+/internal/path/service.py ...
+```
+
+to the MCP client.
+
+Keep detailed diagnostics server-side.
+
+---
+
+# 20. Recommended Decision Matrix
+
+| Failure | Category | MCP Representation | Retry |
+|---|---|---|---|
+| Malformed JSON | Protocol | JSON-RPC Error | No |
+| Invalid MCP request | Protocol | JSON-RPC Error | No |
+| Unknown MCP method | Protocol | JSON-RPC Error | No |
+| Invalid request structure | Protocol | JSON-RPC Error | No |
+| Invalid semantic tool parameter | Tool Validation | `isError=true` | Correct parameter |
+| Account not found | Tool Validation | `isError=true` | Correct parameter |
+| Business rule failure | Tool Business | `isError=true` | No |
+| Upstream HTTP 429 | Tool Upstream | Retry internally, then `isError=true` | Yes |
+| Upstream HTTP 502 | Tool Upstream | Retry internally, then `isError=true` | Yes |
+| Upstream HTTP 503 | Tool Upstream | Retry internally, then `isError=true` | Yes |
+| Upstream HTTP 504 | Tool Upstream | Retry internally, then `isError=true` | Yes |
+| Upstream timeout | Tool Upstream | Retry internally, then `isError=true` | Yes |
+| Authentication failure | Auth | Authentication Layer | Usually No |
+| Authorization failure | Auth | Authorization Layer | No |
+| Unexpected Python bug | Internal | Sanitized Internal Error | No |
+
+---
+
+# 21. Recommended Development Standards for MCP SDK 1.x
+
+Applications remaining on MCP SDK 1.x should follow these standards.
+
+### 1. Pin the SDK Version
+
+Example:
+
+```text
+mcp>=1.28,<2
+```
+
+Avoid accidental major-version upgrades.
+
+---
+
+### 2. Do Not Depend on Implicit Exception Mapping
+
+Application behavior should not depend on how MCP SDK internally converts Python exceptions.
+
+---
+
+### 3. Define an Application Error Hierarchy
+
+At minimum:
+
+```text
+ValidationError
+BusinessError
+UpstreamError
+UpstreamTimeoutError
+RateLimitError
+InternalError
+```
+
+---
+
+### 4. Normalize Expected Tool Failures
+
+Expected and actionable failures should be converted into consistent Tool Execution Errors.
+
+---
+
+### 5. Reserve Protocol Errors for Protocol Failures
+
+Do not use JSON-RPC errors to represent ordinary business or dependency failures simply because an exception occurred.
+
+---
+
+### 6. Normalize Dependency Errors
+
+Convert implementation-specific failures such as:
+
+```text
+HTTPStatusError
+TimeoutError
+DatabaseError
+VendorSDKError
+```
+
+into stable application errors.
+
+---
+
+### 7. Implement Explicit Retry Policies
+
+Use:
+
+```text
+bounded retry
+exponential backoff
+jitter
+```
+
+only for explicitly classified transient failures.
+
+---
+
+### 8. Implement Explicit Timeouts
+
+Every network or external dependency call should have an explicit timeout.
+
+---
+
+### 9. Sanitize Internal Errors
+
+Detailed exceptions belong in server logs.
+
+Client-visible messages should be safe and stable.
+
+---
+
+### 10. Test Error Paths
+
+Each tool should test at minimum:
+
+```text
+Success
+Invalid parameter
+Business failure
+Upstream timeout
+Upstream 5xx
+Unexpected exception
+```
+
+If using structured output / `outputSchema`, test error responses separately.
+
+---
+
+# 22. Designing for Future MCP SDK 2.x Migration
+
+A recommended architecture is:
+
+```text
+                    Business Logic
+                          │
+                          ▼
+                 Application Errors
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+ ValidationError    UpstreamError    BusinessError
+          │               │               │
+          └───────────────┼───────────────┘
+                          │
+                          ▼
+                     Error Mapper
+                          │
+                          ▼
+                     MCP Adapter
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+                ▼                   ▼
+           MCP SDK 1.x         MCP SDK 2.x
+```
+
+This architecture prevents business logic from depending directly on SDK-specific error behavior.
+
+For example:
+
+```text
+UpstreamTimeoutError
+```
+
+remains the same application error regardless of SDK version.
+
+Only:
+
+```text
+MCP Adapter
+```
+
+needs to determine how that error should be represented under the selected SDK.
+
+This significantly reduces future migration effort.
+
+---
+
+# 23. Summary
+
+The primary weakness of MCP SDK 1.x error handling is not that it cannot represent errors.
+
+The larger engineering risk is that applications can easily become dependent on **implicit SDK exception mapping**.
+
+A production MCP Server should therefore avoid:
+
+```text
+Exception
+    ↓
+SDK decides behavior
+```
+
+and instead implement:
+
+```text
+Exception
+    ↓
+Application Error Classification
+    ↓
+Normalization
+    ↓
+Retry / Logging Policy
+    ↓
+MCP Error Mapping
+```
+
+The recommended principle is:
+
+> **Expected and actionable failures should become structured Tool Execution Errors. Protocol-level failures should remain protocol errors. Unexpected internal failures should be logged in detail and exposed only through sanitized responses.**
+
+For MCP SDK 1.x specifically, this application-level abstraction provides three major benefits:
+
+1. **Consistent behavior across tools and SDK layers**
+2. **Better error interpretation and recovery by LLM clients**
+3. **Lower migration cost when moving from MCP SDK 1.x to 2.x**
+
+In short:
+
+```text
+Do not make MCP SDK 1.x's implicit exception behavior
+your application's error-handling architecture.
+
+Build a stable application error contract above the SDK.
+```
