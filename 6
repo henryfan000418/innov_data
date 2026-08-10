@@ -1,0 +1,833 @@
+# Claude MCP Connector Error Handling Requirements
+
+## Purpose
+
+This document summarizes the error-handling expectations for an MCP connector submitted to Claude based on Anthropic's connector review and submission requirements.
+
+Sources:
+
+- Claude Connector Review Criteria: https://claude.com/docs/connectors/building/review-criteria
+- Claude Connector Submission: https://claude.com/docs/connectors/building/submission
+
+---
+
+## 1. Claude's Core Error-Handling Requirement
+
+Anthropic's review criteria require MCP connectors to behave correctly for both valid and invalid inputs.
+
+Most importantly:
+
+> Every tool must return a successful response when called with valid parameters. Generic errors ("Internal Server Error", "Bad Request" with no detail) fail review.
+
+Anthropic also requires connectors to:
+
+> Validate inputs and return actionable error messages rather than silently accepting invalid data.
+
+Therefore, the important requirement is not a particular Python exception class or MCP SDK API.
+
+The requirement is the **behavior exposed to Claude**:
+
+- Valid requests should succeed.
+- Invalid inputs should be validated.
+- Errors should be specific and actionable.
+- Generic error messages should be avoided.
+- Internal implementation details and sensitive information should not be exposed.
+
+---
+
+# 2. Recommended Error Architecture
+
+For an MCP server implemented with:
+
+- FastMCP 3.4.5
+- MCP Python SDK 1.x
+
+errors should be separated according to where they occur in the request lifecycle.
+
+```text
+Incoming Request
+       │
+       ▼
+┌─────────────────────┐
+│ Transport Layer     │
+└─────────────────────┘
+       │
+       ├── Transport Error
+       │
+       ▼
+┌─────────────────────┐
+│ JSON-RPC / MCP      │
+│ Protocol Layer      │
+└─────────────────────┘
+       │
+       ├── Parse Error
+       ├── Invalid Request
+       ├── Method Not Found
+       ├── Other Protocol Errors
+       │
+       ▼
+┌─────────────────────┐
+│ Authentication      │
+└─────────────────────┘
+       │
+       ├── OAuth / Authentication Error
+       │
+       ▼
+┌─────────────────────┐
+│ Tool Execution      │
+└─────────────────────┘
+       │
+       ├── Parameter / Validation Error
+       ├── Business / Domain Error
+       ├── Upstream / Dependency Error
+       ├── Internal / Runtime Error
+       │
+       ▼
+┌─────────────────────┐
+│ Successful Result   │
+└─────────────────────┘
+```
+
+The important architectural boundary is:
+
+```text
+BEFORE TOOL EXECUTION
+────────────────────────────────
+
+Transport Error
+JSON-RPC / MCP Protocol Error
+OAuth / Authentication Error
+
+→ Handle using the appropriate transport,
+  protocol, or authentication mechanism.
+
+
+DURING TOOL EXECUTION
+────────────────────────────────
+
+Parameter / Validation Error
+Business / Domain Error
+Upstream / Dependency Error
+Internal / Runtime Error
+
+→ Return an actionable tool execution error.
+→ With FastMCP 3.4.5, ToolError is a good
+  standard mechanism for these failures.
+```
+
+---
+
+# 3. Tool Execution Errors
+
+Once MCP has successfully invoked a tool, failures should generally be treated as **tool execution errors**.
+
+Recommended categories:
+
+```text
+Tool Execution Error
+│
+├── Parameter / Validation Error
+│
+├── Business / Domain Error
+│
+├── Upstream / Dependency Error
+│
+└── Internal / Runtime Error
+```
+
+These errors should provide enough information for Claude to understand what happened and, where appropriate, determine what to do next.
+
+---
+
+## 3.1 Parameter / Validation Error
+
+Examples:
+
+- Invalid account ID
+- Missing required business parameter
+- Invalid date range
+- Unsupported value
+- Parameter violates a business constraint
+
+Bad:
+
+```text
+Bad Request
+```
+
+Better:
+
+```text
+start_date must be before end_date.
+Update the date range and try again.
+```
+
+Another example:
+
+```text
+Account ID '12345' is invalid.
+Provide a valid account ID and try again.
+```
+
+With FastMCP:
+
+```python
+from fastmcp.exceptions import ToolError
+
+if start_date > end_date:
+    raise ToolError(
+        "start_date must be before end_date. "
+        "Update the date range and try again."
+    )
+```
+
+---
+
+## 3.2 Business / Domain Error
+
+The request may be structurally valid but impossible according to the application's business rules.
+
+Example:
+
+```text
+Account '12345' does not support holdings retrieval.
+Select an investment account and try again.
+```
+
+With FastMCP:
+
+```python
+if not account.supports_holdings:
+    raise ToolError(
+        f"Account '{account_id}' does not support holdings retrieval. "
+        "Select an investment account and try again."
+    )
+```
+
+---
+
+## 3.3 Upstream / Dependency Error
+
+A tool may depend on:
+
+- Internal APIs
+- External APIs
+- Databases
+- Search services
+- Cloud services
+- Vendor systems
+
+If the dependency fails, Claude should receive a useful tool error rather than an unexplained generic failure.
+
+Bad:
+
+```text
+Internal Server Error
+```
+
+Better:
+
+```text
+The holdings service timed out.
+Please retry the request.
+```
+
+Example:
+
+```python
+try:
+    data = await holdings_api.get_holdings(account_id)
+
+except UpstreamTimeout:
+    raise ToolError(
+        "The holdings service timed out. "
+        "Please retry the request."
+    )
+```
+
+---
+
+## 3.4 Internal / Runtime Error
+
+Unexpected bugs and runtime failures can also occur during tool execution.
+
+The server should log detailed diagnostic information internally while returning a safe message to Claude.
+
+For example:
+
+```python
+try:
+    data = await process_request()
+
+except Exception:
+    logger.exception(
+        "Unexpected error while processing holdings request"
+    )
+
+    raise ToolError(
+        "Unable to retrieve holdings because of an internal service error. "
+        "Please try again later."
+    )
+```
+
+This provides Claude with useful information without exposing:
+
+- Stack traces
+- Database information
+- Internal hostnames
+- Credentials
+- Tokens
+- Infrastructure details
+- Sensitive implementation details
+
+---
+
+# 4. Centralized Error Handling
+
+For an enterprise MCP server, a centralized error-normalization layer is recommended.
+
+For example:
+
+```python
+class ValidationFailedError(Exception):
+    pass
+
+
+class UpstreamError(Exception):
+    pass
+
+
+class BusinessError(Exception):
+    pass
+```
+
+Internal application code can raise domain-specific exceptions:
+
+```python
+async def get_holdings_service(account_id: str):
+
+    if not account_id:
+        raise ValidationFailedError(
+            "account_id is required"
+        )
+
+    try:
+        return await upstream.get_holdings(account_id)
+
+    except TimeoutError as exc:
+        raise UpstreamError(
+            "Holdings service timed out"
+        ) from exc
+```
+
+The MCP boundary can then normalize them:
+
+```python
+from fastmcp.exceptions import ToolError
+
+
+@mcp.tool
+async def get_holdings(account_id: str):
+
+    try:
+
+        return await get_holdings_service(account_id)
+
+    except ValidationFailedError as exc:
+
+        raise ToolError(
+            f"{exc}. Provide valid parameters and try again."
+        )
+
+    except BusinessError as exc:
+
+        raise ToolError(str(exc))
+
+    except UpstreamError:
+
+        raise ToolError(
+            "The holdings service is temporarily unavailable. "
+            "Please retry the request."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Unexpected get_holdings failure"
+        )
+
+        raise ToolError(
+            "Unable to retrieve holdings because of an internal service error. "
+            "Please try again later."
+        )
+```
+
+This creates a clean separation between:
+
+```text
+Application / Service Layer
+        │
+        │ raises
+        ▼
+Domain Exceptions
+        │
+        ├── ValidationFailedError
+        ├── BusinessError
+        ├── UpstreamError
+        └── unexpected Exception
+        │
+        ▼
+MCP Error Boundary
+        │
+        │ normalizes
+        ▼
+FastMCP ToolError
+        │
+        ▼
+MCP Tool Error Result
+        │
+        ▼
+Claude
+```
+
+---
+
+# 5. ToolError vs `isError=true`
+
+Anthropic's connector review criteria do **not** require developers to directly construct:
+
+```json
+{
+  "isError": true
+}
+```
+
+Nor do they specifically require:
+
+```python
+raise ToolError(...)
+```
+
+Anthropic's requirement is about **observable behavior**, not the framework API used to implement it.
+
+Conceptually:
+
+```text
+Claude Requirement
+        │
+        ▼
+Correct MCP behavior
+        +
+Input validation
+        +
+Actionable error messages
+        +
+Safe error disclosure
+```
+
+When using FastMCP 3.4.5, `ToolError` is a convenient standard mechanism for representing expected tool execution failures.
+
+Therefore:
+
+```text
+Tool execution fails
+        │
+        ▼
+raise ToolError(...)
+        │
+        ▼
+FastMCP
+        │
+        ▼
+MCP error result
+        │
+        ▼
+Claude receives actionable error
+```
+
+There is generally no need to manually construct `isError=true` responses throughout application code if FastMCP is already managing the MCP result representation.
+
+---
+
+# 6. Do Not Convert Every Error Into ToolError
+
+`ToolError` should primarily represent errors that occur **after a tool invocation has reached the tool execution layer**.
+
+Do not force errors from earlier layers into `ToolError`.
+
+For example:
+
+```text
+Malformed JSON
+        │
+        X
+Tool was never invoked
+        │
+        ▼
+JSON-RPC / protocol error
+```
+
+This should **not** become:
+
+```text
+ToolError("Malformed JSON")
+```
+
+because no tool execution actually occurred.
+
+Similarly:
+
+```text
+Network connection fails
+        │
+        X
+MCP request cannot be processed
+        │
+        ▼
+Transport error
+```
+
+This is not a tool execution error.
+
+---
+
+# 7. Recommended Error Classification
+
+A practical enterprise MCP error model is:
+
+| Layer | Error Category | Recommended Handling |
+|---|---|---|
+| Transport | Connection/network/HTTP transport failure | Transport-level handling |
+| MCP / JSON-RPC | Parse error | JSON-RPC error |
+| MCP / JSON-RPC | Invalid request | JSON-RPC error |
+| MCP / JSON-RPC | Method not found | JSON-RPC error |
+| Authentication | OAuth/authentication failure | OAuth/auth response |
+| Tool | Parameter/validation failure | `ToolError` |
+| Tool | Business/domain failure | `ToolError` |
+| Tool | Upstream/dependency failure | `ToolError` |
+| Tool | Internal/runtime failure | Log internally + safe `ToolError` |
+
+---
+
+# 8. Error Message Design
+
+A useful tool error should ideally communicate:
+
+```text
+WHAT happened
++
+WHY it happened, when safely known
++
+WHAT Claude/user can do next
+```
+
+Example:
+
+```text
+Account '12345' was not found.
+Verify the account ID and try again.
+```
+
+This contains:
+
+```text
+WHAT
+→ Account was not found.
+
+CONTEXT
+→ Account '12345'.
+
+ACTION
+→ Verify the account ID and retry.
+```
+
+Another example:
+
+```text
+The holdings service timed out.
+Please retry the request.
+```
+
+Claude now knows the failure is potentially temporary.
+
+---
+
+# 9. Avoid Generic Errors
+
+Avoid returning errors such as:
+
+```text
+Bad Request
+```
+
+```text
+Internal Server Error
+```
+
+```text
+Something went wrong
+```
+
+```text
+Unknown error
+```
+
+```text
+Request failed
+```
+
+These messages provide insufficient information for Claude to reason about the failure.
+
+Instead, prefer errors such as:
+
+```text
+start_date must be before end_date.
+Update the date range and try again.
+```
+
+or:
+
+```text
+The holdings service timed out.
+Please retry the request.
+```
+
+or:
+
+```text
+Account '12345' was not found.
+Verify the account ID and try again.
+```
+
+---
+
+# 10. Protect Internal Information
+
+Actionable does **not** mean exposing internal implementation details.
+
+For example, do not return:
+
+```text
+psycopg2.OperationalError:
+connection to server db-prod-03.internal.company.com
+failed for user holdings_admin...
+```
+
+Instead, log the detailed error internally:
+
+```python
+logger.exception(
+    "Database failure during holdings retrieval"
+)
+```
+
+and return:
+
+```python
+raise ToolError(
+    "The holdings service is temporarily unavailable. "
+    "Please try again later."
+)
+```
+
+The general pattern should be:
+
+```text
+Internal Logs
+────────────────────────────────
+
+Detailed exception
+Stack trace
+Correlation/request ID
+Dependency information
+Diagnostic information
+
+
+Claude / Client
+────────────────────────────────
+
+Safe error category
+Useful explanation
+Retry guidance
+Corrective action
+```
+
+---
+
+# 11. Recommended Architecture for FastMCP 3.4.5
+
+For a FastMCP 3.4.5 server built on MCP SDK 1.x, the recommended architecture is:
+
+```text
+                     MCP SERVER
+
+Incoming Request
+       │
+       ▼
+┌──────────────────────────────┐
+│ Transport                    │
+│                              │
+│ Handle transport failures    │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ JSON-RPC / MCP Protocol      │
+│                              │
+│ Parse Error                  │
+│ Invalid Request              │
+│ Method Not Found             │
+│ Other protocol errors        │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Authentication / OAuth       │
+│                              │
+│ Authentication failures      │
+│ Authorization failures       │
+└──────────────┬───────────────┘
+               │
+               ▼
+════════════════════════════════
+       TOOL EXECUTION BOUNDARY
+════════════════════════════════
+               │
+               ▼
+┌──────────────────────────────┐
+│ Tool                         │
+│                              │
+│ Parameter validation         │
+│ Business logic               │
+│ Upstream API calls           │
+│ Runtime processing           │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Error Normalization Layer    │
+│                              │
+│ ValidationFailedError        │
+│ BusinessError                │
+│ UpstreamError                │
+│ Unexpected Exception         │
+└──────────────┬───────────────┘
+               │
+               ▼
+          ToolError
+               │
+               ▼
+      MCP Tool Error Result
+               │
+               ▼
+             Claude
+```
+
+---
+
+# 12. Submission Review Checklist
+
+Before submitting a connector to Claude, verify the following.
+
+### Successful Tool Execution
+
+- [ ] Every tool succeeds when given valid parameters.
+- [ ] Successful responses contain useful data.
+- [ ] Response schemas match the declared tool behavior.
+
+### Input Validation
+
+- [ ] Required parameters are validated.
+- [ ] Invalid values are rejected appropriately.
+- [ ] Business constraints are validated.
+- [ ] Invalid inputs produce actionable messages.
+
+### Tool Errors
+
+- [ ] Parameter errors produce useful tool errors.
+- [ ] Business/domain errors produce useful tool errors.
+- [ ] Upstream failures produce useful tool errors.
+- [ ] Runtime failures are safely converted into useful tool errors.
+- [ ] Generic errors are avoided.
+
+### Security
+
+- [ ] Stack traces are not exposed.
+- [ ] Credentials are not exposed.
+- [ ] Tokens are not exposed.
+- [ ] Internal infrastructure details are not exposed.
+- [ ] Sensitive upstream responses are sanitized.
+
+### Protocol Errors
+
+- [ ] Malformed JSON is handled at the JSON-RPC/protocol layer.
+- [ ] Invalid MCP requests are handled at the protocol layer.
+- [ ] Unknown methods are handled at the protocol layer.
+- [ ] Protocol errors are not incorrectly converted into tool execution errors.
+
+### Authentication
+
+- [ ] Authentication failures use the appropriate authentication/OAuth mechanism.
+- [ ] Authentication errors are not incorrectly represented as normal tool failures.
+
+### Testing
+
+- [ ] Every tool has been tested end-to-end.
+- [ ] Valid input has been tested.
+- [ ] Invalid input has been tested.
+- [ ] Upstream failure behavior has been tested.
+- [ ] Unexpected runtime failure behavior has been tested.
+- [ ] Errors shown to Claude are actionable.
+
+---
+
+# 13. Final Recommendation
+
+For a server using:
+
+```text
+FastMCP 3.4.5
++
+MCP Python SDK 1.x
+```
+
+use the following general rule:
+
+```text
+BEFORE TOOL EXECUTION
+
+Transport Error
+JSON-RPC / MCP Protocol Error
+OAuth / Authentication Error
+
+→ Use the corresponding protocol-level mechanism.
+
+
+AFTER TOOL EXECUTION BEGINS
+
+Parameter / Validation Error
+Business / Domain Error
+Upstream / Dependency Error
+Internal / Runtime Error
+
+→ Normalize into actionable tool execution errors.
+→ `raise ToolError(...)` is a good standard FastMCP mechanism.
+```
+
+The most important point is:
+
+> Claude's submission requirements do not mandate `ToolError` or manual `isError=true`. They require correct MCP behavior, successful execution for valid inputs, input validation, and actionable error messages.
+
+Therefore, for FastMCP 3.4.5, a centralized error-handling layer that converts appropriate **tool execution failures into `ToolError`** while leaving **transport, protocol, and authentication errors at their respective layers** is a clean architecture that aligns with Claude's connector review requirements.
+
+---
+
+## References
+
+Claude Connector Review Criteria:
+
+https://claude.com/docs/connectors/building/review-criteria
+
+Claude Connector Submission:
+
+https://claude.com/docs/connectors/building/submission
