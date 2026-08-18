@@ -1,0 +1,215 @@
+# ============================================================
+# MCP JSON-RPC ERROR TESTS - PowerShell / STDIO
+# ============================================================
+#
+# Replace this with your actual MCP server startup PS1 file.
+#
+# Example:
+#   $McpServerScript = ".\start-mcp.ps1"
+#
+# IMPORTANT:
+# Your PS1 launcher must preserve stdin/stdout to the actual
+# FastMCP/MCP server process.
+# ============================================================
+
+$McpServerScript = ".\start-mcp.ps1"
+
+
+# ============================================================
+# TEST 1: -32700 PARSE ERROR
+# ============================================================
+#
+# Purpose:
+#   Send malformed JSON.
+#
+# Expected:
+#   JSON-RPC error code: -32700
+#   "Parse error"
+#
+# MCP/tool execution should NEVER be reached.
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST 1: -32700 Parse Error"
+Write-Host "============================================================"
+
+$Request = '{"jsonrpc":"2.0","id":1,"method":"tools/list",'
+
+Write-Host "Sending:"
+Write-Host $Request
+Write-Host ""
+
+$Request | & $McpServerScript
+
+
+# ============================================================
+# TEST 2: -32600 INVALID REQUEST
+# ============================================================
+#
+# Purpose:
+#   Send valid JSON that is not a valid JSON-RPC request.
+#
+# This request has:
+#   - valid JSON
+#   - jsonrpc
+#   - id
+#   - NO method
+#
+# Expected:
+#   JSON-RPC error code: -32600
+#   "Invalid Request"
+#
+# NOTE:
+# MCP versions/framework implementations can perform additional
+# schema validation, so verify the actual response produced by
+# your SDK/version.
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST 2: -32600 Invalid Request"
+Write-Host "============================================================"
+
+$Request = '{"jsonrpc":"2.0","id":2}'
+
+Write-Host "Sending:"
+Write-Host $Request
+Write-Host ""
+
+$Request | & $McpServerScript
+
+
+# ============================================================
+# TEST 3: -32601 METHOD NOT FOUND
+# ============================================================
+#
+# Purpose:
+#   Send a completely valid JSON-RPC request, but use an MCP
+#   method that does not exist.
+#
+# Expected:
+#   JSON-RPC error code: -32601
+#   "Method not found"
+#
+# This tests MCP/JSON-RPC routing rather than tool execution.
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST 3: -32601 Method Not Found"
+Write-Host "============================================================"
+
+$Request = '{"jsonrpc":"2.0","id":3,"method":"this/method/does/not/exist","params":{}}'
+
+Write-Host "Sending:"
+Write-Host $Request
+Write-Host ""
+
+$Request | & $McpServerScript
+
+
+# ============================================================
+# TEST 4: -32602 INVALID PARAMS
+# ============================================================
+#
+# Purpose:
+#   Call a real MCP protocol method but provide malformed
+#   protocol-level parameters.
+#
+# Here tools/call expects params to be an object containing
+# things such as:
+#
+#   {
+#       "name": "...",
+#       "arguments": {...}
+#   }
+#
+# Instead, params is deliberately sent as a string.
+#
+# Expected:
+#   JSON-RPC error code: -32602
+#   "Invalid params"
+#
+# IMPORTANT:
+# This is NOT the same as passing a bad business argument to
+# an actual tool. Tool input-validation failures may instead
+# become Tool Execution Errors / isError=true.
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST 4: -32602 Invalid Params"
+Write-Host "============================================================"
+
+$Request = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":"THIS_SHOULD_BE_AN_OBJECT"}'
+
+Write-Host "Sending:"
+Write-Host $Request
+Write-Host ""
+
+$Request | & $McpServerScript
+
+
+# ============================================================
+# TEST 5: -32603 INTERNAL ERROR
+# ============================================================
+#
+# IMPORTANT:
+#
+# You normally CANNOT reliably trigger -32603 simply by sending
+# a specially malformed request.
+#
+# -32603 means the JSON-RPC/MCP server itself encountered an
+# unexpected internal failure while processing an otherwise
+# valid protocol request.
+#
+# A normal exception thrown INSIDE an MCP tool is generally a
+# TOOL EXECUTION ERROR, not necessarily -32603.
+#
+# Therefore this test requires you to temporarily add a failure
+# inside the protocol/server handling layer.
+#
+# The request below itself is valid.
+#
+# Expected ONLY IF your server's protocol handler is deliberately
+# configured to crash:
+#
+#   JSON-RPC error code: -32603
+#   "Internal error"
+#
+# DO NOT assume a tool exception will produce -32603.
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST 5: -32603 Internal Error"
+Write-Host "============================================================"
+Write-Host "NOTE: Requires deliberate SERVER/PROTOCOL failure injection."
+Write-Host ""
+
+$Request = '{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}'
+
+Write-Host "Sending valid request:"
+Write-Host $Request
+Write-Host ""
+
+$Request | & $McpServerScript
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "TEST SUMMARY"
+Write-Host "============================================================"
+Write-Host ""
+Write-Host "Test 1  Malformed JSON             -> Expected -32700"
+Write-Host "Test 2  Invalid JSON-RPC request   -> Expected -32600"
+Write-Host "Test 3  Unknown MCP method         -> Expected -32601"
+Write-Host "Test 4  Invalid protocol params    -> Expected -32602"
+Write-Host "Test 5  Internal protocol failure  -> Expected -32603"
+Write-Host ""
+Write-Host "============================================================"
