@@ -1,0 +1,73 @@
+<iframe title="Fabric F4 PAYG vs Reserved Cost Calculator" loading="lazy" sandbox="allow-scripts" style="width:100%;height:460px;border:0;border-radius:12px;" srcdoc="&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Microsoft Fabric F4: PAYG vs Reserved&lt;/title&gt;
+&lt;style&gt;
+  * { box-sizing: border-box; }
+  body { margin:0; background:#fff; color:#19212b; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; }
+  .calculator { width:100%; max-width:750px; margin:auto; padding:24px; }
+  h2 {font-size:19px; margin:0 0 5px; letter-spacing:-.4px;}
+  p {margin:0 0 20px; color:#657081; font-size:12px;}
+  .top {display:flex; align-items:end; justify-content:space-between; gap:12px; margin-bottom:13px;}
+  .top label {font-weight:650;}
+  .hours {font-size:26px; font-weight:750; font-variant-numeric:tabular-nums; white-space:nowrap;}
+  .hours small {font-size:12px; font-weight:450; color:#6b7584;}
+  input[type=range] {width:100%; accent-color:#2469d8; cursor:pointer;}
+  .ends {display:flex;justify-content:space-between; color:#7b8491; font-size:11px;}
+  .presets {display:flex; gap:7px; flex-wrap:wrap; margin:20px 0;}
+  .presets button {cursor:pointer; border:1px solid #cdd5df; color:#354255; background:#fff; padding:8px 11px; border-radius:20px; font:inherit; font-size:12px;}
+  .presets button[aria-pressed=true] {background:#213d65; color:#fff; border-color:#213d65;}
+  .cards {display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+  .card {background:#f4f6f9; border:1px solid #e7ecf1; border-radius:13px; padding:18px;}
+  .card .label {font-size:12px; color:#5f6c7c; font-weight:600;}
+  .card .price {font-size:27px; font-weight:750; margin-top:5px; font-variant-numeric:tabular-nums;}
+  .card .sub {font-size:11px; color:#657081;}
+  .result {margin-top:16px; font-size:14px; font-weight:650;}
+  .foot {font-size:11px; color:#727d8b; margin-top:8px;}
+  @media(max-width:440px) {.calculator {padding:15px;} .card {padding:12px;} .card .price {font-size:23px;} }
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;main class=&quot;calculator&quot;&gt;
+&lt;h2&gt;Fabric F4: PAYG vs. Reserved&lt;/h2&gt;
+&lt;p&gt;Compute-only cost comparison using illustrative F4 reference prices.&lt;/p&gt;
+&lt;div class=&quot;top&quot;&gt;&lt;label for=&quot;hours&quot;&gt;Monthly active hours&lt;/label&gt;&lt;div class=&quot;hours&quot;&gt;&lt;span id=&quot;hourValue&quot;&gt;176&lt;/span&gt; &lt;small&gt;hours&lt;/small&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;input id=&quot;hours&quot; aria-label=&quot;Monthly active hours&quot; type=&quot;range&quot; min=&quot;0&quot; max=&quot;730&quot; step=&quot;1&quot; value=&quot;176&quot;&gt;
+&lt;div class=&quot;ends&quot;&gt;&lt;span&gt;0 hours&lt;/span&gt;&lt;span&gt;730 hours&lt;/span&gt;&lt;/div&gt;
+&lt;div class=&quot;presets&quot;&gt;
+&lt;button type=&quot;button&quot; data-hours=&quot;730&quot;&gt;24/7&lt;/button&gt;
+&lt;button type=&quot;button&quot; data-hours=&quot;264&quot;&gt;12 h/day × 22 days&lt;/button&gt;
+&lt;button type=&quot;button&quot; data-hours=&quot;176&quot;&gt;8 h/day × 22 days&lt;/button&gt;
+&lt;button type=&quot;button&quot; data-hours=&quot;88&quot;&gt;4 h/day × 22 days&lt;/button&gt;
+&lt;/div&gt;
+&lt;div class=&quot;cards&quot;&gt;
+&lt;section class=&quot;card&quot;&gt;&lt;div class=&quot;label&quot;&gt;PAYG with pausing&lt;/div&gt;&lt;div class=&quot;price&quot; id=&quot;payg&quot;&gt;$126.72&lt;/div&gt;&lt;div class=&quot;sub&quot;&gt;$0.72 per active hour&lt;/div&gt;&lt;/section&gt;
+&lt;section class=&quot;card&quot;&gt;&lt;div class=&quot;label&quot;&gt;Reserved commitment&lt;/div&gt;&lt;div class=&quot;price&quot; id=&quot;reserved&quot;&gt;$312.67&lt;/div&gt;&lt;div class=&quot;sub&quot;&gt;Fixed monthly equivalent&lt;/div&gt;&lt;/section&gt;
+&lt;/div&gt;
+&lt;div class=&quot;result&quot; id=&quot;result&quot; aria-live=&quot;polite&quot;&gt;&lt;/div&gt;
+&lt;div class=&quot;foot&quot;&gt;Break-even: about 434 active hours/month. Excludes storage, licenses, capacity usage settlement and other charges. Reservation discounts may apply to other eligible running capacities.&lt;/div&gt;
+&lt;/main&gt;
+&lt;script&gt;
+(function(){
+  const slider=document.getElementById(&#x27;hours&#x27;);
+  const format=value=&gt;&#x27;$&#x27;+value.toLocaleString(&#x27;en-US&#x27;,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const reserved=312.67;
+  const buttons=Array.from(document.querySelectorAll(&#x27;[data-hours]&#x27;));
+  function update(){
+    const h=Number(slider.value), payg=h*0.72, difference=Math.abs(payg-reserved);
+    document.getElementById(&#x27;hourValue&#x27;).textContent=h.toLocaleString(&#x27;en-US&#x27;);
+    document.getElementById(&#x27;payg&#x27;).textContent=format(payg);
+    document.getElementById(&#x27;reserved&#x27;).textContent=format(reserved);
+    document.getElementById(&#x27;result&#x27;).textContent=payg&gt;reserved?&#x27;Reserved saves &#x27;+format(difference)+&#x27;/month at this schedule.&#x27;:&#x27;PAYG saves &#x27;+format(difference)+&#x27;/month at this schedule.&#x27;;
+    buttons.forEach(b=&gt;b.setAttribute(&#x27;aria-pressed&#x27;,String(Number(b.dataset.hours)===h)));
+  }
+  slider.addEventListener(&#x27;input&#x27;,update);
+  buttons.forEach(b=&gt;b.addEventListener(&#x27;click&#x27;,()=&gt;{slider.value=b.dataset.hours;update();}));
+  update();
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+"></iframe>
